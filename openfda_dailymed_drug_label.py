@@ -6,7 +6,7 @@ description: Queries official FDA drug labels via openFDA (api.fda.gov/drug/labe
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
 version: 1.0.0
-license: MIT
+license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
 import asyncio

@@ -6,7 +6,7 @@ description: Strict read-only, path-traversal-proof filename and full-text/PDF s
 required_open_webui_version: 0.4.0
 requirements: pydantic
 version: 1.0.0
-license: MIT
+license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
 import os

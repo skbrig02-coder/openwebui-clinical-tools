@@ -1,21 +1,14 @@
-MIT License
+Stuart Brigham, MD Attribution License
 
-Copyright (c) 2026 Stuart Brigham, MD
+Copyright (c) 2026 Stuart Brigham, MD. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Permission is hereby granted, free of charge, to any person or organization obtaining a copy of this software and associated documentation files (the "Software"), to use, copy, modify, merge, publish, and distribute the Software for clinical, research, educational, personal, or commercial purposes, subject to the following mandatory attribution conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Attribution Requirement: All copies, redistributions, integrations, or derivative works of the Software (in whole or in part, whether in source code, binary, or tool-plugin form) must retain the above copyright notice, this license notice, and clear visible credit to:
+   Stuart Brigham, MD (https://github.com/skbrig02-coder/openwebui-clinical-tools)
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. No Endorsement or Misrepresentation: The name of Stuart Brigham, MD may not be used to endorse or promote products derived from this Software without specific prior written permission, nor may authorship of the original Software be misrepresented.
+
+3. Clinical and Medical Disclaimer: This Software is a clinical research and informational reference tool intended to retrieve public federal reference data and execute published medical equations. It does not constitute medical advice, clinical diagnosis, or treatment recommendations, and does not replace independent physician judgment or primary verification against official drug labeling and clinical guidelines.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, CLINICAL ACCURACY, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import tempfile
 from pathlib import Path
 
 import deployment_inventory
+import tabular_query
 
 
 REPO = Path(__file__).resolve().parent
@@ -156,8 +159,120 @@ def run_stage_queue_tests() -> int:
         if previous is not None:
             os.environ["OPENWEBUI_API_KEY"] = previous
 
+    _tabular_checks(check)
+
     print(f"  [PASS] {checks} staged-queue checks passed.")
     return checks
+
+
+def _tabular_checks(check) -> int:
+    before = 0
+
+    def mark() -> None:
+        nonlocal before
+        before += 1
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        outside = root / "outside"
+        inside = root / "allowed"
+        outside.mkdir()
+        inside.mkdir()
+        csv_path = inside / "labs.csv"
+        csv_path.write_text("age_years,site\n40,A\n41,B\n42,C\n", encoding="utf-8")
+        (str(csv_path) + ".units.json" and Path(str(csv_path) + ".units.json")).write_text(
+            json.dumps({"columns": {"age_years": "year", "site": "code"}}),
+            encoding="utf-8",
+        )
+        secret = outside / "secret.csv"
+        secret.write_text("hidden\n1\n", encoding="utf-8")
+        link = inside / "escape.csv"
+        link.symlink_to(secret)
+        db_path = inside / "cohort.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE data (age_years INTEGER, site TEXT)")
+        conn.execute("INSERT INTO data VALUES (40, 'A')")
+        conn.commit()
+        conn.close()
+        original = db_path.read_bytes()
+
+        empty = tabular_query.run_tabular_query(allowed_roots="", relative_path="labs.csv")
+        check(empty["status"] == "error" and empty["error_type"] == "configuration", empty)
+        mark()
+
+        escape = tabular_query.run_tabular_query(allowed_roots=str(inside), relative_path="../outside/secret.csv")
+        check(escape["error_type"] == "path_rejected", escape)
+        mark()
+        linked = tabular_query.run_tabular_query(allowed_roots=str(inside), relative_path="escape.csv")
+        check(linked["error_type"] == "path_rejected", linked)
+        mark()
+        check(secret.read_text(encoding="utf-8") == "hidden\n1\n", "secret file changed")
+        mark()
+
+        rows = tabular_query.run_tabular_query(
+            allowed_roots=str(inside), relative_path="labs.csv", sql="SELECT age_years, site FROM data WHERE age_years >= 41", max_rows=10
+        )
+        check(rows["status"] == "ok" and rows["match_count"] == 2, rows)
+        mark()
+        check(rows["file_unchanged"] is True, rows)
+        mark()
+        check(any("unit: year" in line for line in rows["schema"]), rows["schema"])
+        mark()
+        rendered = tabular_query.render_tabular_report(rows)
+        check("status: ok" in rendered and "ncbi_eutilities: not_used" in rendered, rendered)
+        mark()
+
+        none = tabular_query.run_tabular_query(
+            allowed_roots=str(inside), relative_path="labs.csv", sql="SELECT * FROM data WHERE age_years < 0"
+        )
+        check(none["status"] == "no_match" and none["match_count"] == 0, none)
+        mark()
+
+        clipped = tabular_query.run_tabular_query(allowed_roots=str(inside), relative_path="labs.csv", max_rows=1)
+        check(clipped["status"] == "partial" and clipped["truncated"] is True, clipped)
+        mark()
+
+        for statement in (
+            "INSERT INTO data VALUES (1, 'z')",
+            "ATTACH DATABASE 'other.sqlite' AS extra",
+            "PRAGMA writable_schema = ON",
+            "SELECT load_extension('nope')",
+            "SELECT 1; DROP TABLE data",
+        ):
+            blocked = tabular_query.run_tabular_query(
+                allowed_roots=str(inside), relative_path="cohort.sqlite", sql=statement
+            )
+            check(blocked["status"] == "error" and blocked["error_type"] == "forbidden_sql", blocked)
+            mark()
+        check(db_path.read_bytes() == original, "sqlite file changed after rejected writes")
+        mark()
+
+        huge = inside / "huge.csv"
+        huge.write_bytes(b"a,b\n" + b"1,2\n" * 50)
+        limited = tabular_query.run_tabular_query(
+            allowed_roots=str(inside), relative_path="huge.csv", max_bytes=20
+        )
+        check(limited["error_type"] == "resource_limit", limited)
+        mark()
+
+        stopped = tabular_query.run_tabular_query(
+            allowed_roots=str(inside), relative_path="labs.csv", sql="SELECT * FROM data", timeout_seconds=0
+        )
+        check(stopped["status"] == "error" and stopped["error_type"] == "timeout", stopped)
+        mark()
+        check(stopped["match_count"] == "unavailable", stopped)
+        mark()
+
+        parquet = tabular_query.run_tabular_query(allowed_roots=str(inside), relative_path="missing.parquet")
+        # File does not exist, so path rejection comes first. Create an empty parquet name that is a file.
+        (inside / "sample.parquet").write_bytes(b"PAR1")
+        parquet = tabular_query.run_tabular_query(allowed_roots=str(inside), relative_path="sample.parquet")
+        check(parquet["error_type"] in {"unavailable_dependency", "unsupported"}, parquet)
+        mark()
+        check("download" in parquet["note"] or parquet["error_type"] == "unsupported", parquet["note"])
+        mark()
+
+    return before
 
 
 if __name__ == "__main__":

@@ -2,15 +2,17 @@
 title: ClinicalTrials.gov REST API v2 Search and NCT Study Lookup
 author: Stuart Brigham, MD
 author_url: https://github.com/skbrig02-coder/openwebui-clinical-tools
-description: Queries the official ClinicalTrials.gov REST API v2 (clinicaltrials.gov/api/v2/studies) by condition, intervention, phase, recruitment status, results availability, or exact NCT ID.
+description: Queries the official ClinicalTrials.gov REST API v2 (clinicaltrials.gov/api/v2/studies) by condition, intervention, phase, recruitment status, results availability, or exact NCT ID. This tool does not call NCBI E-utilities or PubMed. Reports use a UTC retrieval timestamp and keep a successful match count of 0 separate from timeouts, HTTP errors, and malformed responses.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 1.0.0
+version: 1.1.0
 license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
 import asyncio
+import datetime
 import json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,36 +44,99 @@ def _clean(text: str, max_len: int = 600) -> str:
     return s
 
 
-def _sync_get_json(url: str, params: Dict[str, str], timeout: float) -> Tuple[int, Optional[dict]]:
+class Upstream:
+    def __init__(self, status_code: int = 0, payload: Any = None, error_type: str = "", detail: str = ""):
+        self.status_code = int(status_code or 0)
+        self.payload = payload
+        self.error_type = error_type or ""
+        self.detail = detail or ""
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _classify_body(status_code: int, raw: str) -> Upstream:
+    payload = None
+    malformed = False
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            malformed = True
+    else:
+        malformed = True
+    if status_code == 200:
+        if malformed or payload is None:
+            return Upstream(status_code, None, "malformed_response", "Response body was not valid JSON.")
+        return Upstream(status_code, payload, "", "")
+    return Upstream(status_code, None if malformed else payload, "http_error", f"HTTP {status_code}")
+
+
+def _upstream_from_exception(exc: BaseException) -> Upstream:
+    if isinstance(exc, (TimeoutError, socket.timeout)) or "timeout" in type(exc).__name__.lower():
+        return Upstream(0, None, "timeout", "Request timed out.")
+    if isinstance(exc, json.JSONDecodeError) or "json" in type(exc).__name__.lower():
+        return Upstream(0, None, "malformed_response", "Response body was not valid JSON.")
+    return Upstream(0, None, "network_error", "Network request failed.")
+
+
+def _sync_get_json(url: str, params: Dict[str, str], timeout: float) -> Upstream:
     full_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
     req = urllib.request.Request(
         full_url,
-        headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.0", "Accept": "application/json"},
+        headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.1", "Accept": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-            return resp.status, json.loads(raw)
-    except urllib.error.HTTPError as e:
-        return e.code, None
-    except Exception:
-        return 0, None
+            raw = resp.read().decode("utf-8", errors="replace")
+            return _classify_body(getattr(resp, "status", 200) or 200, raw)
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        return _classify_body(exc.code, raw)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return Upstream(0, None, "timeout", "Request timed out.")
+        return Upstream(0, None, "network_error", "Network request failed.")
+    except (TimeoutError, socket.timeout):
+        return Upstream(0, None, "timeout", "Request timed out.")
+    except Exception as exc:
+        return _upstream_from_exception(exc)
 
 
-async def _async_get_json(url: str, params: Dict[str, str], timeout: float) -> Tuple[int, Optional[dict]]:
+async def _async_get_json(url: str, params: Dict[str, str], timeout: float) -> Upstream:
     if httpx is not None:
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
-                headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.0", "Accept": "application/json"},
+                headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.1", "Accept": "application/json"},
             ) as client:
                 resp = await client.get(url, params=params)
-                if resp.status_code == 200:
-                    return 200, resp.json()
-                return resp.status_code, None
-        except Exception:
-            return 0, None
+                return _classify_body(resp.status_code, resp.text)
+        except Exception as exc:
+            return _upstream_from_exception(exc)
     return await asyncio.to_thread(_sync_get_json, url, params, timeout)
+
+
+def _invalid_lookup(message: str) -> str:
+    return "\n".join(
+        [
+            message,
+            "- status: invalid_input",
+            "- provenance: live_http",
+            f"- checked_at_utc: {_utc_now_iso()}",
+            "- ncbi_eutilities: not_used",
+            "- note: No upstream request was sent.",
+        ]
+    )
+
+
+_UPSTREAM_FAILURE_NOTE = "Upstream request failed. This result is not a finding of zero matching records."
 
 
 class Tools:
@@ -117,8 +182,13 @@ class Tools:
         :param max_results: Maximum number of trials to return (1 to 25).
         :return: Structured Markdown list of matching clinical trials with NCT links, phases, sample sizes, and endpoints.
         """
+        condition = condition or ""
+        intervention = intervention or ""
+        query_term = query_term or ""
+        status = status or "ALL"
+        phase = phase or ""
         if not any([condition.strip(), intervention.strip(), query_term.strip()]):
-            return "Error: Provide at least one of condition, intervention, or query_term."
+            return _invalid_lookup("Error: Provide at least one of condition, intervention, or query_term.")
 
         limit = max(1, min(int(max_results or self.valves.DEFAULT_PAGE_SIZE), 25))
         params = {
@@ -149,25 +219,72 @@ class Tools:
             params["aggFilters"] = "results:with"
 
         full_query_url = f"{self.base_url}?{urllib.parse.urlencode(params)}"
-        status_code, data = await _async_get_json(
+        fetched = await _async_get_json(
             self.base_url, params, float(self.valves.TIMEOUT_SECONDS)
         )
-        if status_code != 200 or not data:
-            return f"Error querying ClinicalTrials.gov API v2 (HTTP {status_code}): {full_query_url}"
+        if (
+            fetched.error_type
+            or fetched.status_code != 200
+            or not isinstance(fetched.payload, dict)
+            or "studies" not in fetched.payload
+            or not isinstance(fetched.payload.get("studies"), list)
+        ):
+            error_type = fetched.error_type or ("malformed_response" if fetched.status_code == 200 else "http_error")
+            return "\n".join(
+                [
+                    "# ClinicalTrials.gov API v2 Search Results",
+                    "",
+                    "## Retrieval record",
+                    "- status: error",
+                    "- match_count: unavailable",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    f"- clinicaltrials: status=error error_type: {error_type} http_status={fetched.status_code}",
+                    f"- note: {_UPSTREAM_FAILURE_NOTE}",
+                    f"- endpoint: {self.base_url}",
+                ]
+            )
 
+        data = fetched.payload
         studies = data.get("studies") or []
         total_count = data.get("totalCount", len(studies))
         if not studies:
-            return f"No trials found matching parameters. API URL: {full_query_url}"
+            return "\n".join(
+                [
+                    "# ClinicalTrials.gov API v2 Search Results",
+                    "",
+                    "## Retrieval record",
+                    "- status: no_match",
+                    "- match_count: 0",
+                    f"- total_count: {total_count}",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- note: ClinicalTrials.gov responded successfully and the match count is 0.",
+                    f"- endpoint: {full_query_url}",
+                ]
+            )
 
         lines = [
             "# ClinicalTrials.gov API v2 Search Results",
+            "",
+            "## Retrieval record",
+            "- status: ok",
+            f"- match_count: {len(studies)}",
+            f"- total_count: {total_count}",
+            f"- retrieved_at_utc: {_utc_now_iso()}",
+            "- provenance: live_http",
+            "- ncbi_eutilities: not_used",
+            "- note: retrieved_at_utc is when this tool called the API. source_content_date is the study record date when the API provided one.",
             f"- **Total Matching Studies:** {total_count} (showing top {len(studies)})",
             f"- **API v2 Endpoint Called:** {full_query_url}",
             "",
         ]
 
         for idx, st in enumerate(studies, start=1):
+            if not isinstance(st, dict):
+                continue
             proto = st.get("protocolSection") or {}
             ident = proto.get("identificationModule") or {}
             status_mod = proto.get("statusModule") or {}
@@ -208,7 +325,9 @@ class Tools:
             lines.append(f"- **Sponsor:** {_clean(sponsor, 150)}")
             lines.append(f"- **Conditions:** {_clean(conditions, 250)}")
             lines.append(f"- **Interventions:** {_clean(interventions, 250)}")
+            source_date = (status_mod.get("lastUpdatePostDateStruct") or {}).get("date") or "not_provided_by_response"
             lines.append(f"- **Primary Outcome:** {prim_measure}")
+            lines.append(f"- source_content_date: {source_date}")
             lines.append(f"- **Study Record Link:** {study_url}")
             lines.append("")
 
@@ -228,14 +347,57 @@ class Tools:
         """
         clean_id = (nct_id or "").strip().upper()
         if not clean_id.startswith("NCT"):
-            return "Error: nct_id must start with 'NCT' (for example, 'NCT03819153')."
+            return _invalid_lookup("Error: nct_id must start with 'NCT' (for example, 'NCT03819153').")
 
         url = f"{self.base_url}/{clean_id}"
-        status_code, st = await _async_get_json(url, {}, float(self.valves.TIMEOUT_SECONDS))
-        if status_code == 404:
-            return f"No ClinicalTrials.gov study found for NCT ID `{clean_id}`."
-        if status_code != 200 or not st:
-            return f"Error fetching study `{clean_id}` (HTTP {status_code})."
+        fetched = await _async_get_json(url, {}, float(self.valves.TIMEOUT_SECONDS))
+        if fetched.status_code == 404:
+            return "\n".join(
+                [
+                    f"# ClinicalTrials.gov Study Record: {clean_id}",
+                    "",
+                    "## Retrieval record",
+                    "- status: no_match",
+                    "- match_count: 0",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- clinicaltrials: status=no_match http_status=404",
+                    "- note: ClinicalTrials.gov responded and has no study for this NCT ID. The match count is 0.",
+                ]
+            )
+        if fetched.error_type or fetched.status_code != 200 or not isinstance(fetched.payload, dict):
+            error_type = fetched.error_type or ("malformed_response" if fetched.status_code == 200 else "http_error")
+            return "\n".join(
+                [
+                    f"# ClinicalTrials.gov Study Record: {clean_id}",
+                    "",
+                    "## Retrieval record",
+                    "- status: error",
+                    "- match_count: unavailable",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    f"- clinicaltrials: status=error error_type: {error_type} http_status={fetched.status_code}",
+                    f"- note: {_UPSTREAM_FAILURE_NOTE}",
+                ]
+            )
+        st = fetched.payload
+        if "protocolSection" not in st:
+            return "\n".join(
+                [
+                    f"# ClinicalTrials.gov Study Record: {clean_id}",
+                    "",
+                    "## Retrieval record",
+                    "- status: error",
+                    "- match_count: unavailable",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- clinicaltrials: status=error error_type: malformed_response http_status=200",
+                    f"- note: {_UPSTREAM_FAILURE_NOTE}",
+                ]
+            )
 
         proto = st.get("protocolSection") or {}
         ident = proto.get("identificationModule") or {}
@@ -255,8 +417,18 @@ class Tools:
         enrollment = (design.get("enrollmentInfo") or {}).get("count", "N/A")
         phases = ", ".join(design.get("phases") or []) or "N/A"
 
+        source_date = (status_mod.get("lastUpdatePostDateStruct") or {}).get("date") or results_date
         lines = [
             f"# ClinicalTrials.gov Study Record: {clean_id}" + (f" ({acronym})" if acronym else ""),
+            "",
+            "## Retrieval record",
+            "- status: ok",
+            "- match_count: 1",
+            f"- retrieved_at_utc: {_utc_now_iso()}",
+            "- provenance: live_http",
+            "- ncbi_eutilities: not_used",
+            f"- source_content_date: {source_date}",
+            "- note: retrieved_at_utc is when this tool called the API. Start, completion, and results dates are source dates.",
             f"- **Title:** {title}",
             f"- **Overall Status:** `{overall_status}` | **Phase:** {phases} | **Enrollment:** {enrollment}",
             f"- **Start Date:** {start_date} | **Completion Date:** {comp_date} | **Results First Posted:** {results_date}",

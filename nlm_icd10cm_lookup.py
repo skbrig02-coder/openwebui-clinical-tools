@@ -2,15 +2,17 @@
 title: NLM ICD-10-CM Official Code and Diagnosis Lookup
 author: Stuart Brigham, MD
 author_url: https://github.com/skbrig02-coder/openwebui-clinical-tools
-description: Queries the official NLM Clinical Tables ICD-10-CM API v3 (clinicaltables.nlm.nih.gov/api/icd10cm/v3/search) by diagnosis description or code prefix.
+description: Queries the official NLM Clinical Tables ICD-10-CM API v3 (clinicaltables.nlm.nih.gov/api/icd10cm/v3/search) by diagnosis description or code prefix. This tool does not call NCBI E-utilities or PubMed. Reports use a UTC retrieval timestamp and keep a successful match count of 0 separate from timeouts, HTTP errors, and malformed responses.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 1.0.0
+version: 1.1.0
 license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
 import asyncio
+import datetime
 import json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,36 +41,99 @@ def _clean(text: str) -> str:
     return " ".join(str(text).replace("\u2014", " - ").replace("\u2013", "-").split())
 
 
-def _sync_get_json(url: str, params: Dict[str, str], timeout: float) -> Tuple[int, Optional[ Any]]:
+class Upstream:
+    def __init__(self, status_code: int = 0, payload: Any = None, error_type: str = "", detail: str = ""):
+        self.status_code = int(status_code or 0)
+        self.payload = payload
+        self.error_type = error_type or ""
+        self.detail = detail or ""
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _classify_body(status_code: int, raw: str) -> Upstream:
+    payload = None
+    malformed = False
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            malformed = True
+    else:
+        malformed = True
+    if status_code == 200:
+        if malformed or payload is None:
+            return Upstream(status_code, None, "malformed_response", "Response body was not valid JSON.")
+        return Upstream(status_code, payload, "", "")
+    return Upstream(status_code, None if malformed else payload, "http_error", f"HTTP {status_code}")
+
+
+def _upstream_from_exception(exc: BaseException) -> Upstream:
+    if isinstance(exc, (TimeoutError, socket.timeout)) or "timeout" in type(exc).__name__.lower():
+        return Upstream(0, None, "timeout", "Request timed out.")
+    if isinstance(exc, json.JSONDecodeError) or "json" in type(exc).__name__.lower():
+        return Upstream(0, None, "malformed_response", "Response body was not valid JSON.")
+    return Upstream(0, None, "network_error", "Network request failed.")
+
+
+def _sync_get_json(url: str, params: Dict[str, str], timeout: float) -> Upstream:
     full_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
     req = urllib.request.Request(
         full_url,
-        headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.0", "Accept": "application/json"},
+        headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.1", "Accept": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-            return resp.status, json.loads(raw)
-    except urllib.error.HTTPError as e:
-        return e.code, None
-    except Exception:
-        return 0, None
+            raw = resp.read().decode("utf-8", errors="replace")
+            return _classify_body(getattr(resp, "status", 200) or 200, raw)
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        return _classify_body(exc.code, raw)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return Upstream(0, None, "timeout", "Request timed out.")
+        return Upstream(0, None, "network_error", "Network request failed.")
+    except (TimeoutError, socket.timeout):
+        return Upstream(0, None, "timeout", "Request timed out.")
+    except Exception as exc:
+        return _upstream_from_exception(exc)
 
 
-async def _async_get_json(url: str, params: Dict[str, str], timeout: float) -> Tuple[int, Optional[Any]]:
+async def _async_get_json(url: str, params: Dict[str, str], timeout: float) -> Upstream:
     if httpx is not None:
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
-                headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.0", "Accept": "application/json"},
+                headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.1", "Accept": "application/json"},
             ) as client:
                 resp = await client.get(url, params=params)
-                if resp.status_code == 200:
-                    return 200, resp.json()
-                return resp.status_code, None
-        except Exception:
-            return 0, None
+                return _classify_body(resp.status_code, resp.text)
+        except Exception as exc:
+            return _upstream_from_exception(exc)
     return await asyncio.to_thread(_sync_get_json, url, params, timeout)
+
+
+def _invalid_lookup(message: str) -> str:
+    return "\n".join(
+        [
+            message,
+            "- status: invalid_input",
+            "- provenance: live_http",
+            f"- checked_at_utc: {_utc_now_iso()}",
+            "- ncbi_eutilities: not_used",
+            "- note: No upstream request was sent.",
+        ]
+    )
+
+
+_UPSTREAM_FAILURE_NOTE = "Upstream request failed. This result is not a finding of zero matching records."
 
 
 class Tools:
@@ -109,7 +174,7 @@ class Tools:
         """
         q = (query or "").strip()
         if not q:
-            return "Error: query is required."
+            return _invalid_lookup("Error: query is required.")
 
         limit = max(1, min(int(max_results or self.valves.DEFAULT_MAX_RESULTS), 50))
         mode = (search_mode or "both").strip().lower()
@@ -128,19 +193,84 @@ class Tools:
         }
         full_url = f"{self.base_url}?{urllib.parse.urlencode(params)}"
 
-        status_code, data = await _async_get_json(
+        fetched = await _async_get_json(
             self.base_url, params, float(self.valves.TIMEOUT_SECONDS)
         )
-        if status_code != 200 or not isinstance(data, list) or len(data) < 4:
-            return f"Error querying NLM Clinical Tables ICD-10-CM API (HTTP {status_code}): {full_url}"
+        if fetched.error_type or fetched.status_code != 200 or not isinstance(fetched.payload, list) or len(fetched.payload) < 4:
+            error_type = fetched.error_type or ("malformed_response" if fetched.status_code == 200 else "http_error")
+            return "\n".join(
+                [
+                    f"# NLM ICD-10-CM Official Code Lookup: {q}",
+                    "",
+                    "## Retrieval record",
+                    "- status: error",
+                    "- match_count: unavailable",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- source_content_date: not_provided_by_response",
+                    f"- icd10cm: status=error error_type: {error_type} http_status={fetched.status_code}",
+                    f"- note: {_UPSTREAM_FAILURE_NOTE}",
+                    f"- endpoint: {self.base_url}",
+                ]
+            )
 
+        data = fetched.payload
         total_count = data[0]
         rows = data[3] or []
+        if not isinstance(rows, list):
+            return "\n".join(
+                [
+                    f"# NLM ICD-10-CM Official Code Lookup: {q}",
+                    "",
+                    "## Retrieval record",
+                    "- status: error",
+                    "- match_count: unavailable",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- source_content_date: not_provided_by_response",
+                    "- icd10cm: status=error error_type: malformed_response http_status=200",
+                    f"- note: {_UPSTREAM_FAILURE_NOTE}",
+                ]
+            )
         if not rows:
-            return f"No ICD-10-CM codes found for '{q}' (search_mode='{sf}'). API URL: {full_url}"
+            shown_total = total_count if isinstance(total_count, int) else 0
+            overall = "partial" if shown_total else "no_match"
+            note = (
+                "The API reported a positive total with no display rows. This incomplete response is not a confirmed match count of 0."
+                if overall == "partial"
+                else "NLM Clinical Tables responded successfully and the match count is 0."
+            )
+            return "\n".join(
+                [
+                    f"# NLM ICD-10-CM Official Code Lookup: {q}",
+                    "",
+                    "## Retrieval record",
+                    f"- status: {overall}",
+                    "- match_count: 0" if overall == "no_match" else "- match_count: unavailable",
+                    f"- total_count: {shown_total}",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- source_content_date: not_provided_by_response",
+                    f"- note: {note}",
+                    f"- endpoint: {full_url}",
+                ]
+            )
 
         lines = [
             f"# NLM ICD-10-CM Official Code Lookup: {q}",
+            "",
+            "## Retrieval record",
+            "- status: ok",
+            f"- match_count: {len(rows)}",
+            f"- total_count: {total_count}",
+            f"- retrieved_at_utc: {_utc_now_iso()}",
+            "- provenance: live_http",
+            "- ncbi_eutilities: not_used",
+            "- source_content_date: not_provided_by_response",
+            "- note: This API response does not include a source release date. retrieved_at_utc is when this tool called NLM Clinical Tables.",
             f"- **Total Matches in NLM ICD-10-CM Table:** {total_count} (showing top {len(rows)})",
             f"- **Search Fields (`sf`):** `{sf}`",
             f"- **NLM Clinical Tables API URL:** {full_url}",

@@ -2,6 +2,8 @@
 
 **Prepared for:** Stuart Brigham, MD (local RTX 3060 workstation Open WebUI Setup)
 **Date:** Wednesday, October 28, 2026
+
+**Correction, 7 November 2026:** The six tools in this repository do not call NCBI E-utilities or PubMed. PMID strings in `clinical_calculators.py` are static citations. Wiesner 2003 Table 4 mortality percentages (PMID 12512033) are reported only for the original MELD(i) integer. They are not applied to MELD-Na or MELD 3.0, and no replacement mortality percentages were added for those scores. Integer MELD(i) 9 has no Wiesner table column and is reported as unavailable. Live lookups now state a UTC retrieval time and separate a successful match count of 0 from timeout, HTTP error, malformed response, and partial retrieval. Passing `verify_all_tools.py` does not clinically validate the calculators.
 **Scope:** Audit of existing Open WebUI Community Hub tools (`openwebui.com/t/`), GitHub repositories, and MCP tool packages across the 6 planned clinical tool categories, plus live verification of custom-built replacement tools in `/workspace/openwebui_medical_tools/`.
 
 ---

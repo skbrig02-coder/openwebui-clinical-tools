@@ -2,13 +2,14 @@
 title: Deterministic Clinical Calculators (CrCl, CKD-EPI 2021 eGFR, CHA2DS2-VASc, Wells DVT/PE, MELD-Na / MELD 3.0)
 author: Stuart Brigham, MD
 author_url: https://github.com/skbrig02-coder/openwebui-clinical-tools
-description: Zero-hallucination, deterministic Python implementations of Cockcroft-Gault CrCl, CKD-EPI 2021 race-free eGFR, CHA2DS2-VASc, Wells Score for DVT, Wells Score for PE, and MELD / MELD-Na / MELD 3.0 with primary literature citations (PMIDs) and step-by-step breakdowns.
+description: Deterministic Python implementations of Cockcroft-Gault CrCl, CKD-EPI 2021 race-free eGFR, CHA2DS2-VASc, Wells Score for DVT, Wells Score for PE, and MELD(i) / MELD-Na / MELD 3.0. PMID citations are static text and are not retrieved from NCBI or PubMed. Wiesner 2003 3-month mortality bands are reported only for the original MELD(i) integer; MELD-Na and MELD 3.0 mortality percentages are unavailable.
 required_open_webui_version: 0.4.0
 requirements: pydantic
-version: 1.0.0
+version: 1.1.0
 license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
+import datetime
 import math
 from typing import Optional
 try:
@@ -21,6 +22,57 @@ except ImportError:
 
     def Field(default=None, **kwargs):  # type: ignore
         return default
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _invalid(message: str) -> str:
+    return "\n".join(
+        [
+            f"Input Validation Error: {message}",
+            "- status: invalid_input",
+            "- provenance: local_deterministic_calculation",
+            f"- checked_at_utc: {_utc_now_iso()}",
+            "- ncbi_eutilities: not_used",
+            "- citation_mode: static_pmid",
+            "- note: No score was calculated.",
+        ]
+    )
+
+
+def _provenance_lines() -> list:
+    return [
+        "",
+        "## Provenance",
+        "- status: ok",
+        "- provenance: local_deterministic_calculation",
+        f"- computed_at_utc: {_utc_now_iso()}",
+        "- ncbi_eutilities: not_used",
+        "- citation_mode: static_pmid",
+        "- note: This report was calculated locally. Any PMID in this report is a static citation and was not retrieved from NCBI or PubMed.",
+    ]
+
+
+def _original_meld_wiesner_band(score: int):
+    """Observed 3-month mortality bands from Wiesner 2003 Table 4.
+
+    Wiesner et al., Gastroenterology 2003;124(1):91-96 (PMID 12512033) reported
+    bands for original MELD <9, 10-19, 20-29, 30-39, and >=40 (results text).
+    Integer 9 is not a column in that table.
+    """
+    if score < 9:
+        return "1.9% (band MELD <9)"
+    if 10 <= score <= 19:
+        return "6.0% (band MELD 10-19)"
+    if 20 <= score <= 29:
+        return "19.6% (band MELD 20-29)"
+    if 30 <= score <= 39:
+        return "52.6% (band MELD 30-39)"
+    if score >= 40:
+        return "71.3% (band MELD >=40)"
+    return None
 
 
 def _norm_sex(sex: str) -> str:
@@ -36,7 +88,7 @@ class Tools:
     class Valves(BaseModel):
         INCLUDE_FORMULAS_AND_PMIDS: bool = Field(
             default=True,
-            description="Include exact mathematical formulas and PubMed IDs (PMIDs) in every calculator output.",
+            description="Include exact mathematical formulas and static PubMed IDs (PMIDs) in calculator output. This tool does not query NCBI or PubMed.",
         )
 
     def __init__(self):
@@ -65,14 +117,14 @@ class Tools:
         try:
             sex_norm = _norm_sex(sex)
         except ValueError as e:
-            return f"Input Validation Error: {e}"
+            return _invalid(str(e))
 
         if not (18 <= age_years <= 120):
-            return "Input Validation Error: age_years must be between 18 and 120."
+            return _invalid("age_years must be between 18 and 120.")
         if not (20.0 <= weight_kg <= 400.0):
-            return "Input Validation Error: weight_kg must be between 20 and 400 kg."
+            return _invalid("weight_kg must be between 20 and 400 kg.")
         if not (0.1 <= serum_creatinine_mg_dl <= 30.0):
-            return "Input Validation Error: serum_creatinine_mg_dl must be between 0.1 and 30.0 mg/dL."
+            return _invalid("serum_creatinine_mg_dl must be between 0.1 and 30.0 mg/dL.")
 
         sex_factor = 0.85 if sex_norm == "F" else 1.0
         crcl_actual = ((140.0 - age_years) * weight_kg) / (72.0 * serum_creatinine_mg_dl) * sex_factor
@@ -87,7 +139,7 @@ class Tools:
 
         if height_cm is not None:
             if not (100.0 <= height_cm <= 250.0):
-                return "Input Validation Error: height_cm must be between 100 and 250 cm."
+                return _invalid("height_cm must be between 100 and 250 cm.")
             height_in = height_cm / 2.54
             base_ibw = 45.5 if sex_norm == "F" else 50.0
             ibw_kg = max(20.0, base_ibw + 2.3 * (height_in - 60.0))
@@ -133,6 +185,7 @@ class Tools:
                     "- **References:** Cockcroft DW, Gault MH. *Nephron*. 1976;16(1):31-41 (PMID: 1244564); Winter MA et al. *Pharmacotherapy*. 2012;32(7):604-612 (PMID: 22892266).",
                 ]
             )
+        lines.extend(_provenance_lines())
         return "\n".join(lines)
 
     def calculate_ckd_epi_2021_egfr(
@@ -158,12 +211,12 @@ class Tools:
         try:
             sex_norm = _norm_sex(sex)
         except ValueError as e:
-            return f"Input Validation Error: {e}"
+            return _invalid(str(e))
 
         if not (18 <= age_years <= 120):
-            return "Input Validation Error: age_years must be between 18 and 120 (CKD-EPI 2021 is validated in adults >= 18)."
+            return _invalid("age_years must be between 18 and 120 (CKD-EPI 2021 is validated in adults >= 18).")
         if not (0.1 <= serum_creatinine_mg_dl <= 30.0):
-            return "Input Validation Error: serum_creatinine_mg_dl must be between 0.1 and 30.0 mg/dL."
+            return _invalid("serum_creatinine_mg_dl must be between 0.1 and 30.0 mg/dL.")
 
         if sex_norm == "F":
             kappa = 0.7
@@ -226,6 +279,7 @@ class Tools:
                     "- **References:** Inker LA et al. *N Engl J Med*. 2021;385(19):1737-1749 (PMID: 34554658); KDIGO 2024 CKD Guideline *Kidney Int*. 2024;105(4S):S117-S314 (PMID: 38490803).",
                 ]
             )
+        lines.extend(_provenance_lines())
         return "\n".join(lines)
 
     def calculate_cha2ds2_vasc(
@@ -253,10 +307,10 @@ class Tools:
         try:
             sex_norm = _norm_sex(sex)
         except ValueError as e:
-            return f"Input Validation Error: {e}"
+            return _invalid(str(e))
 
         if not (18 <= age_years <= 120):
-            return "Input Validation Error: age_years must be between 18 and 120."
+            return _invalid("age_years must be between 18 and 120.")
 
         if age_years >= 75:
             age_pts = 2
@@ -335,6 +389,7 @@ class Tools:
                     "- **References:** Lip GY et al. *Chest*. 2010;137(2):263-272 (PMID: 19762550); Friberg L et al. *Eur Heart J*. 2012;33(12):1500-1510 (PMID: 22246443); Joglar JA et al. 2023 ACC/AHA/ACCP/HRS AF Guideline *Circulation*. 2024;149(1):e1-e156 (PMID: 38033089).",
                 ]
             )
+        lines.extend(_provenance_lines())
         return "\n".join(lines)
 
     def calculate_wells_dvt(
@@ -419,6 +474,7 @@ class Tools:
                     "- **References:** Wells PS et al. *Lancet*. 1997;350(9094):1795-1798 (PMID: 9428249); Wells PS et al. *N Engl J Med*. 2003;349(13):1227-1235 (PMID: 14507948).",
                 ]
             )
+        lines.extend(_provenance_lines())
         return "\n".join(lines)
 
     def calculate_wells_pe(
@@ -487,6 +543,7 @@ class Tools:
                     "- **References:** Wells PS et al. *Thromb Haemost*. 2000;83(3):416-420 (PMID: 10744147); van Belle A et al. (Christopher Study) *JAMA*. 2006;295(2):172-179 (PMID: 16403929).",
                 ]
             )
+        lines.extend(_provenance_lines())
         return "\n".join(lines)
 
     def calculate_meld_scores(
@@ -501,7 +558,7 @@ class Tools:
     ) -> str:
         """
         Calculate deterministic MELD(i) (2016 base), MELD-Na (UNOS/OPTN 2016), and MELD 3.0 (Kim et al. 2021 / OPTN July 2023 standard)
-        for end-stage liver disease severity and 90-day waitlist mortality estimation.
+        for end-stage liver disease severity. A Wiesner 2003 3-month mortality band is reported only for the original MELD(i) integer. MELD-Na and MELD 3.0 mortality percentages are unavailable.
 
         :param bilirubin_mg_dl: Total bilirubin in mg/dL (0.1 to 60.0; values < 1.0 are clamped to 1.0 per OPTN policy).
         :param inr: International Normalized Ratio (0.5 to 20.0; values < 1.0 are clamped to 1.0 per OPTN policy).
@@ -510,16 +567,16 @@ class Tools:
         :param sex: Optional biological sex ('M' or 'F'), required along with albumin_g_dl to compute MELD 3.0.
         :param albumin_g_dl: Optional serum albumin in g/dL (0.5 to 7.0; clamped to [1.5, 3.5] for MELD 3.0).
         :param dialysis_twice_in_past_week: True if patient had >= 2 dialysis treatments in the prior 7 days or 24h of CVVHD (sets Cr = 4.0 for MELD-Na and Cr = 3.0 for MELD 3.0).
-        :return: Markdown report with MELD(i), MELD-Na, and MELD 3.0 scores, clamping audit trail, and 90-day mortality estimates.
+        :return: Markdown report with MELD(i), MELD-Na, and MELD 3.0 scores, clamping audit trail, and model-specific mortality reporting.
         """
         if not (0.1 <= bilirubin_mg_dl <= 60.0):
-            return "Input Validation Error: bilirubin_mg_dl must be between 0.1 and 60.0 mg/dL."
+            return _invalid("bilirubin_mg_dl must be between 0.1 and 60.0 mg/dL.")
         if not (0.5 <= inr <= 20.0):
-            return "Input Validation Error: inr must be between 0.5 and 20.0."
+            return _invalid("inr must be between 0.5 and 20.0.")
         if not (0.1 <= creatinine_mg_dl <= 25.0):
-            return "Input Validation Error: creatinine_mg_dl must be between 0.1 and 25.0 mg/dL."
+            return _invalid("creatinine_mg_dl must be between 0.1 and 25.0 mg/dL.")
         if not (100.0 <= sodium_meq_l <= 170.0):
-            return "Input Validation Error: sodium_meq_l must be between 100 and 170 mEq/L."
+            return _invalid("sodium_meq_l must be between 100 and 170 mEq/L.")
 
         bili_clamped = max(1.0, float(bilirubin_mg_dl))
         inr_clamped = max(1.0, float(inr))
@@ -563,9 +620,9 @@ class Tools:
             try:
                 sex_norm = _norm_sex(sex)
             except ValueError as e:
-                return f"Input Validation Error: {e}"
+                return _invalid(str(e))
             if not (0.5 <= albumin_g_dl <= 7.0):
-                return "Input Validation Error: albumin_g_dl must be between 0.5 and 7.0 g/dL."
+                return _invalid("albumin_g_dl must be between 0.5 and 7.0 g/dL.")
             alb_clamped = min(3.5, max(1.5, float(albumin_g_dl)))
             female_pts = 1.33 if sex_norm == "F" else 0.0
             meld_3_raw = (
@@ -580,18 +637,6 @@ class Tools:
                 + 6.0
             )
             meld_3_int = min(40, max(6, int(math.floor(meld_3_raw + 0.5))))
-
-        primary_score = meld_3_int if meld_3_int is not None else meld_na_int
-        if primary_score <= 9:
-            mortality_band = "~1.9% 90-day mortality (MELD <= 9)"
-        elif primary_score <= 19:
-            mortality_band = "~6.0% 90-day mortality (MELD 10-19)"
-        elif primary_score <= 29:
-            mortality_band = "~19.6% 90-day mortality (MELD 20-29)"
-        elif primary_score <= 39:
-            mortality_band = "~52.6% 90-day mortality (MELD 30-39)"
-        else:
-            mortality_band = "~71.3% 90-day mortality (MELD >= 40)"
 
         lines = [
             "# MELD(i), MELD-Na, and MELD 3.0 Liver Disease Severity Calculator",
@@ -608,7 +653,25 @@ class Tools:
             lines.append(
                 "- **MELD 3.0 (OPTN July 2023 Standard):** *Pass both `sex` ('M'/'F') and `albumin_g_dl` to compute MELD 3.0.*"
             )
-        lines.append(f"- **Estimated 90-Day Mortality (Wiesner 2003 reference band):** {mortality_band}")
+        wiesner_band = _original_meld_wiesner_band(meld_i_int)
+        if wiesner_band is None:
+            lines.append(
+                "- Original MELD 3-month mortality: unavailable. "
+                "Wiesner 2003 Table 4 (PMID: 12512033) reports observed 3-month mortality for original MELD bands <9, 10-19, 20-29, 30-39, and >=40. "
+                f"Integer MELD(i) {meld_i_int} is not one of those reported bands. This tool does not fill that gap."
+            )
+        else:
+            lines.append(
+                f"- Original MELD 3-month mortality: {wiesner_band} for MELD(i) {meld_i_int}. "
+                "Source: Wiesner et al., Gastroenterology. 2003;124(1):91-96 (PMID: 12512033), Table 4, with the top band stated as MELD >=40 in the results text. "
+                "Cohort: 3437 adults with chronic liver disease added to the OPTN waiting list at status 2A or 2B from November 1999 through December 2001. "
+                "The paper scored the original three-variable MELD (creatinine, bilirubin, and INR, with values below 1 set to 1). "
+                "The rate is an observed band percentage in that cohort, not an individual survival prediction. "
+                "MELD(i) in this tool also caps creatinine at 4.0 and bounds the integer from 6 to 40, which that paper did not do. "
+                "This percentage was not revalidated by this tool."
+            )
+        lines.append("- MELD-Na mortality percentage: unavailable. Wiesner 2003 Table 4 is omitted for MELD-Na.")
+        lines.append("- MELD 3.0 mortality percentage: unavailable. Wiesner 2003 Table 4 is omitted for MELD 3.0.")
 
         lines.extend(
             [
@@ -633,7 +696,8 @@ class Tools:
                     "- **MELD(i):** `10 * (0.957 * ln(Cr) + 0.378 * ln(Bili) + 1.120 * ln(INR) + 0.643)`",
                     "- **MELD-Na:** `MELD(i) + 1.32 * (137 - Na) - 0.033 * MELD(i) * (137 - Na)` (when MELD(i) > 11)",
                     "- **MELD 3.0:** `1.33*(if Female) + 4.56*ln(Bili) + 0.82*(137 - Na) - 0.24*(137 - Na)*ln(Bili) + 9.09*ln(INR) + 11.14*ln(Cr) + 1.85*(3.5 - Alb) - 1.83*(3.5 - Alb)*ln(Cr) + 6`",
-                    "- **References:** Kamath PS et al. *Hepatology*. 2001;33(2):464-470 (PMID: 11172350); Kim WR et al. *N Engl J Med*. 2008;359(10):1018-1026 (PMID: 18768945); Kim WR et al. *Gastroenterology*. 2021;161(6):1887-1895.e4 (PMID: 34481845).",
+                    "- **References (static citations, not retrieved from NCBI):** Kamath PS et al. *Hepatology*. 2001;33(2):464-470 (PMID: 11172350); Kim WR et al. *N Engl J Med*. 2008;359(10):1018-1026 (PMID: 18768945); Wiesner R et al. *Gastroenterology*. 2003;124(1):91-96 (PMID: 12512033); Kim WR et al. *Gastroenterology*. 2021;161(6):1887-1895.e4 (PMID: 34481845). MELD-Na coefficients in this tool are the OPTN form stated by Kim 2021 (1.32 and 0.033, sodium bounded 125 to 137, applied when the base MELD is above 11).",
                 ]
             )
+        lines.extend(_provenance_lines())
         return "\n".join(lines)

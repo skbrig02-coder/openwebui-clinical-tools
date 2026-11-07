@@ -558,6 +558,9 @@ def assert_no_forbidden_dashes(text: str, label: str) -> None:
 
 async def run_all_tests() -> None:
     await run_deterministic_tests()
+    import verify_stage_queue
+
+    verify_stage_queue.run_stage_queue_tests()
 
     print("=== 1. Testing Category 1: openFDA + DailyMed Drug Label Lookup ===")
     fda_tool = OpenFdaDailyMedTools()

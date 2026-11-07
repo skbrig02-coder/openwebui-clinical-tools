@@ -68,6 +68,12 @@ Merging or pulling this repository does not change either installed Open WebUI. 
 6. Optional check from this repository directory: `python3 verify_all_tools.py`. The deterministic section does not need network access. The six live groups need outbound HTTPS to `api.fda.gov`, `dailymed.nlm.nih.gov`, `rxnav.nlm.nih.gov`, `clinicaltrials.gov`, and `clinicaltables.nlm.nih.gov`.
 7. A passing verification script is a regression check of formulas, bounds, citations, and response handling. It is not a clinical validation of the calculators.
 
+## Staged queue after the six-tool fix (not installed)
+
+The six existing tools are unchanged by the later queue until a stage says otherwise. These additions are repository code only. They are not installed in Open WebUI by this pull request.
+
+`deployment_inventory.py` is the rank-1 health check from the November 7, 2026 plan, extended through `verify_all_tools.py`. It is repository code and is not installed. A run labels `environment` so a checkout is not reported as a production pass (`production_instance_pass` stays false). It records each local tool file's `version` and `content_sha256`. If `OPENWEBUI_API_KEY` is unset, installed tools, valves, access grants, model bindings, and live execution are `untested` and no request is sent. The key is read only from that environment variable. The command does not open a database or browser cookies. With a key, it GETs `/api/v1/tools/` (active tools), `/api/v1/tools/list` (registry and access grants), `/api/v1/tools/id/{id}`, `/api/v1/tools/id/{id}/valves`, and `/api/v1/models/export`. A tool present in the registry and absent from the active list is `registered, not enabled`. `callable` and `reference_tested` stay `untested`: Open WebUI documents tool invocation only as `POST /api/chat/completions` with `tool_ids`, which also runs a model, and this program does not call that endpoint. There is no documented read-only execute API, and none is invented here. `--backup-dir` writes fetched ids, valves, and grants locally and does not update Open WebUI. `OPENWEBUI_BASE_URL` defaults to `http://127.0.0.1:3000`. Missing `meta.toolIds` is `field_absent`, not an empty binding list.
+
 ## Running the Verification Suite Locally
 
 ```bash

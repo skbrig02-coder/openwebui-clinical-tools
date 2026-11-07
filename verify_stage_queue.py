@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 import deployment_inventory
+import retrieval_manifest
 import tabular_query
 
 
@@ -160,6 +161,7 @@ def run_stage_queue_tests() -> int:
             os.environ["OPENWEBUI_API_KEY"] = previous
 
     _tabular_checks(check)
+    _manifest_checks(check)
 
     print(f"  [PASS] {checks} staged-queue checks passed.")
     return checks
@@ -273,6 +275,99 @@ def _tabular_checks(check) -> int:
         mark()
 
     return before
+
+
+def _manifest_checks(check) -> None:
+    import tempfile
+
+    try:
+        retrieval_manifest.build_record(
+            status="ok",
+            retrieved_at_utc="2026-11-07T12:00:00+00:00",
+            source="example",
+            endpoint="https://example.test",
+            parameters={},
+        )
+        check(False, "offset timestamp should be rejected")
+    except ValueError:
+        check(True, "offset rejected")
+    try:
+        retrieval_manifest.build_record(
+            status="ok",
+            retrieved_at_utc="2026-11-07T12:00:00Z",
+            source="example",
+            endpoint="https://example.test",
+            parameters={"patient": "hidden"},
+        )
+        check(False, "patient field should be rejected")
+    except ValueError:
+        check(True, "patient field rejected")
+
+    original = retrieval_manifest.build_record(
+        status="no_match",
+        retrieved_at_utc="2020-01-02T03:04:05Z",
+        source="openfda",
+        endpoint="https://api.fda.gov/drug/label.json",
+        parameters={"search": "missing-drug"},
+        query="missing-drug",
+        match_count=0,
+        source_urls=["https://api.fda.gov/drug/label.json"],
+    )
+    failed = retrieval_manifest.build_record(
+        status="error",
+        retrieved_at_utc="2020-01-02T03:05:05Z",
+        source="openfda",
+        endpoint="https://api.fda.gov/drug/label.json",
+        parameters={"doi": "10.1000/test"},
+        query="10.1000/test",
+        error_type="rate_limit",
+        source_urls=["https://api.fda.gov/drug/label.json"],
+    )
+    again = retrieval_manifest.build_record(
+        status="ok",
+        retrieved_at_utc="2020-01-02T04:05:05Z",
+        source="crossref-not-called",
+        endpoint="https://api.crossref.org/works",
+        parameters={"doi": "10.1000/test"},
+        query="10.1000/test",
+        unresolved=True,
+    )
+    check(failed["unresolved"] is True, failed)
+    check(original["clinical_conclusion"] is None, original)
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        jsonl = directory / "manifest.jsonl"
+        retrieval_manifest.append_jsonl(jsonl, original)
+        retrieval_manifest.append_jsonl(jsonl, failed)
+        retrieval_manifest.append_jsonl(jsonl, again)
+        retrieval_manifest.cache_put(directory / "cache", original)
+        cached = retrieval_manifest.cache_get(directory / "cache", original)
+        check(cached is not None and cached["served_from_cache"] is True, cached)
+        check(cached["retrieved_at_utc"] == "2020-01-02T03:04:05Z", cached)
+        check(cached["cached_read_at_utc"] != cached["retrieved_at_utc"], cached)
+        exported = retrieval_manifest.export_manifest(jsonl)
+        check(exported["counts"]["no_match"] == 1, exported["counts"])
+        check(exported["counts"]["error"] == 1, exported["counts"])
+        check(exported["counts"]["ok"] == 1, exported["counts"])
+        check(len(exported["unresolved"]) == 2, exported["unresolved"])
+        check("10.1000/test" in exported["duplicate_dois_kept"], exported["duplicate_dois_kept"])
+        check(len(exported["duplicate_dois_kept"]["10.1000/test"]) == 2, "duplicate rows were dropped")
+        check(exported["clinical_conclusion"] is None, exported)
+    report = "\n".join(
+        [
+            "# Example",
+            "## Retrieval record",
+            "- status: partial",
+            "- retrieved_at_utc: 2026-11-07T15:04:05Z",
+            "- error_type: timeout",
+            "See https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json for the source.",
+        ]
+    )
+    ingested = retrieval_manifest.ingest_tool_report(
+        report, source="dailymed", endpoint="https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
+    )
+    check(ingested["status"] == "partial" and ingested["error_type"] == "timeout", ingested)
+    check(any(url.startswith("https://dailymed.nlm.nih.gov/") for url in ingested["source_urls"]), ingested["source_urls"])
 
 
 if __name__ == "__main__":

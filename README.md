@@ -76,6 +76,8 @@ The six existing tools are unchanged by the later queue until a stage says other
 
 `tabular_query.py` is the rank-5 read-only dataset query. It is not installed. `ALLOWED_ROOTS` defaults to empty, so every query fails closed. CSV and SQLite SELECT or WITH queries stay inside the allowlist, reject `..`, absolute paths, and symlink escape, and use a SQLite authorizer plus `mode=ro` so writes, ATTACH, PRAGMA, and loadable extensions do not run. Results include schema, a unit from a sibling `.units.json` when the owner supplied one, otherwise `not_provided_by_file`, a file sha256, and `queried_at_utc`. A row cap is `status: partial`. Zero rows are `status: no_match`. A file over the byte cap is `resource_limit` and is not read as a result set. Parquet is `unavailable_dependency` when pyarrow is absent, and this module does not install it. No public dataset is queried.
 
+`retrieval_manifest.py` is the rank-6 local manifest. It is not installed and it does not call Crossref, Europe PMC, PMC, or OpenAlex. Records require `status` and `retrieved_at_utc` in `YYYY-MM-DDTHH:MM:SSZ`. `error` is not exported as `no_match`. Cache hits set `served_from_cache` and keep the original retrieval time. There is no age expiry, because an owner cache policy has not been chosen. Parameters named like patient identifiers are rejected. Duplicate DOIs are listed and kept. `clinical_conclusion` is always null. The citation/retraction tool and the Crossref adapter are not built: PubMed 2.0/2.1 was not audited, and the plan says Crossref response fields must be confirmed before coding.
+
 ## Running the Verification Suite Locally
 
 ```bash

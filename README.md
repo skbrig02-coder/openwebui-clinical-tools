@@ -16,7 +16,7 @@ This directory (`/workspace/openwebui_medical_tools/`) contains the complete com
    - Supports filtering by condition, intervention, free-text term/acronym, recruitment status (`filter.overallStatus`), study phase (`AREA[Phase]`), and posted results (`aggFilters=results:with`), plus single-study NCT lookup with `resultsSection` primary outcome statistical analyses.
 5. `local_clinical_library_search.py` (**Category 4 - Companion to Open WebUI Native Knowledge RAG**):
    - Primary recommendation for Category 4 is to use **Open WebUI's built-in Workspace -> Knowledge (RAG Collections)** with **Hybrid Search** enabled in Admin Settings -> Documents.
-   - This optional companion tool provides strict read-only, `Path.resolve()`-jailed filename inventory and exact keyword/acronym search across `.md`, `.txt`, `.html`, and `.pdf` files inside `Documents\AI Teams\Clinical Library` without allowing directory traversal outside the configured root.
+   - This optional companion tool provides strict read-only, `Path.resolve()`-jailed filename inventory and exact keyword/acronym search across `.md`, `.txt`, `.html`, and `.pdf` files inside the folder set by the `CLINICAL_LIBRARY_DIR` valve. `Documents\AI Teams\Clinical Library` is an example of that folder. The search stays inside the configured root.
 6. `clinical_calculators.py` (**Category 5 - Custom Built**):
    - Zero-`eval()`, deterministic Python implementations with physiologic bounds checking, standard clinical half-up rounding for integer scores, step-by-step score breakdowns, guideline interpretation bands, and static PubMed ID (PMID) citations for:
      - **Cockcroft-Gault CrCl** (Actual, Devine Ideal, and 40% Adjusted Body Weight CrCl; PMIDs 1244564, 22892266)
@@ -39,7 +39,7 @@ These six tools do not call NCBI E-utilities or PubMed. DailyMed, RxNorm, Clinic
 3. Copy and paste the contents of any `.py` tool file from `/workspace/openwebui_medical_tools/` and click **Save**.
 4. For **Category 4 (Local Clinical Library)**:
    - Go to **Admin Panel -> Settings -> Documents** and enable **Hybrid Search**.
-   - Go to **Workspace -> Knowledge -> + Create Knowledge Base**, name it `Clinical Library`, and upload the guideline PDFs and clinical summaries from `Documents\AI Teams\Clinical Library`.
+   - Go to **Workspace -> Knowledge -> + Create Knowledge Base**, name it `Clinical Library`, and upload your own guideline PDFs and clinical summaries. `Documents\AI Teams\Clinical Library` is an example of a folder those files might come from.
    - Bind the `Clinical Library` Knowledge Collection and the 5 custom tools to your custom clinical model preset under **Workspace -> Models**.
 
 ## Lookup status, time, and provenance
@@ -89,3 +89,24 @@ python3 /workspace/openwebui_medical_tools/verify_all_tools.py
 # Or with uv + httpx + pydantic:
 uv run --with pydantic --with httpx python3 /workspace/openwebui_medical_tools/verify_all_tools.py
 ```
+
+## FAQ
+
+### Does local_clinical_library_search come with a clinical library?
+
+No. It ships with no documents. It only searches a folder of your own files on the machine running Open WebUI, set with the `CLINICAL_LIBRARY_DIR` valve. It reads `.md`, `.txt`, `.html`, `.htm`, `.pdf`, `.csv`, and `.json` files in that folder. It never searches the internet. Point it at a folder of your own guidelines, notes, or PDFs.
+
+`Documents\AI Teams\Clinical Library` is an example. The valve default in the tool source is `C:\Users\Stuart\Documents\AI Teams\Clinical Library`, the same example on one workstation. This repository does not include that folder. Any directory of your own files is a valid setting.
+
+With no folder that exists, or with an empty one, there is nothing to search. If `CLINICAL_LIBRARY_DIR` is missing or is not a directory, the tool reports a configuration error (`status: error`) and does not search. An empty folder returns no matches (`status: no_match`, `match_count: 0`). That empty result is expected, not a bug.
+
+A large library can hit the scan limits. The limit valves, with the default and the maximum each valve accepts:
+
+- `MAX_FILES_SCANNED`: default `200`, maximum `2000`
+- `MAX_FILE_BYTES`: default `2000000`, maximum `50000000`
+- `MAX_PDF_PAGES`: default `25`, maximum `150`
+- `TIMEOUT_SECONDS`: default `5.0`, maximum `60`
+
+Reaching `MAX_FILES_SCANNED` or `TIMEOUT_SECONDS`, or skipping a file larger than `MAX_FILE_BYTES`, reports the result as `status: partial`. If that incomplete scan also found no matches, `match_count` is `unavailable`. `MAX_PDF_PAGES` is how many pages of each PDF are read. Stopping at that page count does not, by itself, mark the result partial.
+
+The drug label tool (`openfda_dailymed_drug_label.py`), the RxNorm tool (`nlm_rxnorm_lookup.py`), the ICD-10-CM tool (`nlm_icd10cm_lookup.py`), and the ClinicalTrials.gov tool (`clinicaltrials_v2_search.py`) call public HTTP APIs. The calculators in `clinical_calculators.py` compute locally and do not call an API.

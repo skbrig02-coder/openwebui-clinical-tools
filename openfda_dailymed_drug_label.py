@@ -5,13 +5,14 @@ author_url: https://github.com/skbrig02-coder/openwebui-clinical-tools
 description: Queries official FDA drug labels via openFDA (api.fda.gov/drug/label.json) and NLM DailyMed SPLs (dailymed.nlm.nih.gov/dailymed/services/v2/). This tool does not call NCBI E-utilities or PubMed. Each report states retrieval time in UTC and separates a successful match count of 0 from timeouts, HTTP errors, and malformed responses.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 1.1.0
+version: 1.2.0
 license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
 import asyncio
 import datetime
 import json
+import re
 import socket
 import urllib.error
 import urllib.parse
@@ -44,15 +45,81 @@ def _clean_text(text: str, max_chars: int = 1800) -> str:
     return cleaned
 
 
-def _extract_section(record: dict, key: str, max_chars: int = 1800) -> str:
+_DOSING_TERMS = (
+    "renal",
+    "kidney",
+    "hepatic",
+    "liver",
+    "child-pugh",
+    "child pugh",
+    "dialysis",
+    "impairment",
+    "creatinine clearance",
+    "crcl",
+    "egfr",
+)
+_IMPORTANT_SECTION_CHARS = 8000
+
+
+def _section_text(record: dict, key: str) -> str:
     val = record.get(key)
     if not val:
-        return "Not listed in this label section."
+        return ""
     if isinstance(val, list):
-        joined = " ".join(str(x) for x in val if x)
-    else:
-        joined = str(val)
+        return " ".join(str(item) for item in val if item)
+    return str(val)
+
+
+def _extract_section(record: dict, key: str, max_chars: int = 1800) -> str:
+    joined = _section_text(record, key)
+    if not joined:
+        return "Not listed in this label section."
     return _clean_text(joined, max_chars=max_chars)
+
+
+def _dosing_excerpts(cleaned: str, already_shown: str, limit: int = 4000) -> list[str]:
+    excerpts: list[str] = []
+    used = 0
+    for part in re.split(r"(?<=[.!?])\s+", cleaned):
+        sentence = part.strip()
+        if not sentence or sentence in already_shown:
+            continue
+        lowered = sentence.lower()
+        if not any(term in lowered for term in _DOSING_TERMS):
+            continue
+        if used + len(sentence) > limit:
+            break
+        excerpts.append(sentence)
+        used += len(sentence)
+    return excerpts
+
+
+def _section_lines(record: dict, key: str, max_chars: int, *, important: bool = False, keep_dosing: bool = False) -> list[str]:
+    joined = _section_text(record, key)
+    if not joined:
+        return ["Not listed in this label section."]
+    cleaned = " ".join(joined.replace("\u2014", " - ").replace("\u2013", "-").split())
+    limit = _IMPORTANT_SECTION_CHARS if important else max_chars
+    truncated = len(cleaned) > limit
+    shown = cleaned[:limit] + ("... [truncated]" if truncated else "")
+    lines = [shown]
+    if truncated:
+        lines.append(
+            f"- truncation: `{key}` was cut at {limit} characters. "
+            "The character cap omitted the tail of this section. The DailyMed link has the full label."
+        )
+    if keep_dosing:
+        excerpts = _dosing_excerpts(cleaned, shown)
+        if excerpts:
+            lines.append(
+                "- renal_hepatic_excerpts: sentences about renal or hepatic dosing were copied from the full section, including text past the character cap."
+            )
+            lines.extend(f"  - {excerpt}" for excerpt in excerpts)
+        elif truncated and any(term in cleaned.lower() for term in _DOSING_TERMS):
+            lines.append(
+                "- renal_hepatic_excerpts: dosing terms were present, but the excerpt budget was exhausted."
+            )
+    return lines
 
 
 class Upstream:
@@ -388,23 +455,22 @@ class Tools:
             boxed = chosen_record.get("boxed_warning")
             lines.append("## 2. Boxed Warning")
             if boxed:
-                lines.append(
-                    f"**BOXED WARNING PRESENT:** {_extract_section(chosen_record, 'boxed_warning', max_c)}"
-                )
+                lines.append("**BOXED WARNING PRESENT:**")
+                lines.extend(_section_lines(chosen_record, "boxed_warning", max_c, important=True, keep_dosing=True))
             else:
                 lines.append("No boxed warning section present in this SPL record.")
             lines.append("")
 
             lines.append("## 3. Indications and Usage")
-            lines.append(_extract_section(chosen_record, "indications_and_usage", max_c))
+            lines.extend(_section_lines(chosen_record, "indications_and_usage", max_c))
             lines.append("")
 
             lines.append("## 4. Dosage and Administration")
-            lines.append(_extract_section(chosen_record, "dosage_and_administration", max_c))
+            lines.extend(_section_lines(chosen_record, "dosage_and_administration", max_c, keep_dosing=True))
             lines.append("")
 
             lines.append("## 5. Contraindications")
-            lines.append(_extract_section(chosen_record, "contraindications", max_c))
+            lines.extend(_section_lines(chosen_record, "contraindications", max_c, important=True))
             lines.append("")
 
             lines.append("## 6. Warnings and Precautions")
@@ -427,7 +493,7 @@ class Tools:
             lines.append("")
 
             lines.append("## 9. Use in Specific Populations / Renal or Hepatic Dosing")
-            lines.append(_extract_section(chosen_record, "use_in_specific_populations", max_c))
+            lines.extend(_section_lines(chosen_record, "use_in_specific_populations", max_c, keep_dosing=True))
             lines.append("")
 
         if dailymed_items:

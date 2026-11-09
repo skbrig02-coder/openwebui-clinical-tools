@@ -311,6 +311,50 @@ async def _run_deterministic_tests() -> int:
     check(OPENFDA_KEY_SENTINEL not in out_down, out_down)
     _assert_machine_time(out_down, "drug timeout")
 
+    def route_limited(url: str):
+        if "api.fda.gov" in url or "dailymed.nlm.nih.gov" in url:
+            return 429, b'{"error":{"code":"TOO_MANY_REQUESTS"}}'
+        raise AssertionError(url)
+
+    with patched_urlopen(route_limited):
+        out_limited = await fda.lookup_drug_label("apixaban")
+    check("status: error" in out_limited and "error_type: http_error" in out_limited and "http_status=429" in out_limited, out_limited)
+    check("status: no_match" not in out_limited, out_limited)
+    check("No FDA label or DailyMed SPL records found" not in out_limited, out_limited)
+    check("not a finding of zero matching records" in out_limited, out_limited)
+
+    filler = "General administration guidance. " * 80
+    long_label = {
+        "results": [
+            {
+                "set_id": "set-long",
+                "effective_time": "20240101",
+                "boxed_warning": ["y" * 2500 + " BOXED WARNING SENTINEL: fatal bleeding."],
+                "contraindications": ["x" * 2500 + " CONTRAINDICATION SENTINEL: active bleeding."],
+                "dosage_and_administration": [filler + "RENAL DOSING SENTINEL: reduce dose when CrCl is low."],
+                "use_in_specific_populations": [filler + "HEPATIC DOSING SENTINEL: avoid in Child-Pugh C."],
+                "indications_and_usage": ["Indication."],
+                "openfda": {"generic_name": ["APIXABAN"], "substance_name": ["APIXABAN"]},
+            }
+        ]
+    }
+
+    def route_long(url: str):
+        if "api.fda.gov" in url:
+            return 200, _json_bytes(long_label)
+        if "dailymed.nlm.nih.gov" in url:
+            return 200, b'{"data":[]}'
+        raise AssertionError(url)
+
+    with patched_urlopen(route_long):
+        out_long = await fda.lookup_drug_label("apixaban", include_dailymed_spls=False)
+    check("RENAL DOSING SENTINEL" in out_long, out_long[-800:])
+    check("HEPATIC DOSING SENTINEL" in out_long, out_long[-800:])
+    check("BOXED WARNING SENTINEL" in out_long, out_long[:1200])
+    check("CONTRAINDICATION SENTINEL" in out_long, out_long)
+    check("truncation:" in out_long, out_long)
+    assert_no_forbidden_dashes(out_long, "truncated label")
+
     def route_partial(url: str):
         if "api.fda.gov" in url:
             return 200, _json_bytes(label)
@@ -501,30 +545,30 @@ async def _run_deterministic_tests() -> int:
         (tmp_path / "zeta.md").write_text("uniquezeta term\n", encoding="utf-8")
         lib = LocalLibraryTools()
         lib.valves.CLINICAL_LIBRARY_DIR = str(tmp_path)
-        out_star = lib.search_local_clinical_library("*")
+        out_star = await lib.search_local_clinical_library("*")
         check("status: ok" in out_star, out_star)
         check("provenance: local_filesystem" in out_star, out_star)
         check("not a live federal or NCBI lookup" in out_star, out_star)
         check(f"searched_at_utc: {FROZEN_UTC}" in out_star, out_star)
-        out_hit = lib.search_local_clinical_library("uniquezeta")
+        out_hit = await lib.search_local_clinical_library("uniquezeta")
         check("status: ok" in out_hit and "uniquezeta term" in out_hit, out_hit)
-        out_lib_miss = lib.search_local_clinical_library("absent-phrase")
+        out_lib_miss = await lib.search_local_clinical_library("absent-phrase")
         check("status: no_match" in out_lib_miss and "match_count: 0" in out_lib_miss, out_lib_miss)
         check("provenance: local_filesystem" in out_lib_miss, out_lib_miss)
         lib.valves.MAX_FILES_SCANNED = 1
-        out_capped = lib.search_local_clinical_library("uniquezeta")
+        out_capped = await lib.search_local_clinical_library("uniquezeta")
         check("status: partial" in out_capped, out_capped)
         check("No matches found" not in out_capped, out_capped)
         check("scan_capped: true" in out_capped, out_capped)
 
     lib_missing = LocalLibraryTools()
     lib_missing.valves.CLINICAL_LIBRARY_DIR = "/tmp/clinical-library-does-not-exist-aee9"
-    out_missing = lib_missing.search_local_clinical_library("kdigo")
+    out_missing = await lib_missing.search_local_clinical_library("kdigo")
     check("status: error" in out_missing and "error_type: configuration" in out_missing, out_missing)
     check("No matches found" not in out_missing, out_missing)
     check("not a zero-match result" in out_missing, out_missing)
 
-    out_lib_blank = lib_missing.search_local_clinical_library("  ")
+    out_lib_blank = await lib_missing.search_local_clinical_library("  ")
     check("status: invalid_input" in out_lib_blank, out_lib_blank)
     check("match_count: 0" not in out_lib_blank, out_lib_blank)
 
@@ -540,12 +584,58 @@ async def _run_deterministic_tests() -> int:
             (tmp_path / "guide.md").write_text("secret term\n", encoding="utf-8")
             lib = LocalLibraryTools()
             lib.valves.CLINICAL_LIBRARY_DIR = str(tmp_path)
-            out_unreadable = lib.search_local_clinical_library("secret")
+            out_unreadable = await lib.search_local_clinical_library("secret")
     finally:
         Path.read_text = original_read
     check("status: partial" in out_unreadable, out_unreadable)
     check("No matches found" not in out_unreadable, out_unreadable)
     check("files_unreadable: 1" in out_unreadable, out_unreadable)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        (tmp_path / "guide.md").write_text("kept term\n", encoding="utf-8")
+        (tmp_path / "broken.md").symlink_to(tmp_path / "missing.md")
+        (tmp_path / "loop").symlink_to(tmp_path)
+        lib = LocalLibraryTools()
+        lib.valves.CLINICAL_LIBRARY_DIR = str(tmp_path)
+        out_link = await lib.search_local_clinical_library("kept")
+    check("kept term" in out_link, out_link)
+    check("files_skipped_symlink:" in out_link, out_link)
+    check("status: partial" in out_link or "status: ok" in out_link, out_link)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        (tmp_path / "slow.md").write_text("alpha\n", encoding="utf-8")
+        lib = LocalLibraryTools()
+        lib.valves.CLINICAL_LIBRARY_DIR = str(tmp_path)
+        lib.valves.TIMEOUT_SECONDS = 0
+        out_time = await lib.search_local_clinical_library("alpha")
+    check("time_capped: true" in out_time, out_time)
+    check("status: partial" in out_time, out_time)
+    check("No matches found" not in out_time, out_time)
+
+    order = []
+
+    def _slow_search(self, query, filename_filter="", max_matches=15):
+        import time as _time
+
+        _time.sleep(0.25)
+        order.append("search")
+        return "slept"
+
+    original_search = LocalLibraryTools._search_local_clinical_library_sync
+    LocalLibraryTools._search_local_clinical_library_sync = _slow_search
+    try:
+        lib = LocalLibraryTools()
+
+        async def _tick():
+            await asyncio.sleep(0.05)
+            order.append("tick")
+
+        await asyncio.gather(lib.search_local_clinical_library("x"), _tick())
+    finally:
+        LocalLibraryTools._search_local_clinical_library_sync = original_search
+    check(order[:1] == ["tick"], order)
 
     print(f"  [PASS] {checks} deterministic checks passed.")
     return checks
@@ -615,11 +705,11 @@ async def run_all_tests() -> None:
         )
         lib_tool = LocalLibraryTools()
         lib_tool.valves.CLINICAL_LIBRARY_DIR = str(tmp_path)
-        out_lib_list = lib_tool.search_local_clinical_library("*")
+        out_lib_list = await lib_tool.search_local_clinical_library("*")
         assert "KDIGO_2024_CKD_Summary.md" in out_lib_list
         assert "status: ok" in out_lib_list and "provenance: local_filesystem" in out_lib_list
         assert "searched_at_utc: " in out_lib_list and FROZEN_UTC not in out_lib_list
-        out_lib_hit = lib_tool.search_local_clinical_library("SGLT2 inhibitor")
+        out_lib_hit = await lib_tool.search_local_clinical_library("SGLT2 inhibitor")
         assert "eGFR >= 20" in out_lib_hit
         assert_no_forbidden_dashes(out_lib_hit, "Local library search output")
     print("  [PASS] Local Clinical Library path-jailed search succeeded.")

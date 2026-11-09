@@ -78,6 +78,10 @@ The six existing tools are unchanged by the later queue until a stage says other
 
 `retrieval_manifest.py` is the rank-6 local manifest. It is not installed and it does not call Crossref, Europe PMC, PMC, or OpenAlex. Records require `status` and `retrieved_at_utc` in `YYYY-MM-DDTHH:MM:SSZ`. `error` is not exported as `no_match`. Cache hits set `served_from_cache` and keep the original retrieval time. There is no age expiry, because an owner cache policy has not been chosen. Parameters named like patient identifiers are rejected. Duplicate DOIs are listed and kept. `clinical_conclusion` is always null. The citation/retraction tool and the Crossref adapter are not built: PubMed 2.0/2.1 was not audited, and the plan says Crossref response fields must be confirmed before coding.
 
+## Continuous integration
+
+`.github/workflows/deterministic-tests.yml` runs `run_deterministic_tests` and `verify_stage_queue.py` on push and pull request. Those suites mock upstream HTTP. A green run does not call openFDA, DailyMed, RxNorm, ClinicalTrials.gov, or Clinical Tables, and it is not a clinical validation. `python3 verify_all_tools.py` still runs the live groups locally when you choose to.
+
 ## Running the Verification Suite Locally
 
 ```bash

@@ -5,14 +5,16 @@ author_url: https://github.com/skbrig02-coder/openwebui-clinical-tools
 description: Strict read-only, path-traversal-proof filename and full-text/PDF search over the local Clinical Library folder to complement Open WebUI built-in Workspace Knowledge Collections. This is a local filesystem search, not a live federal, NCBI, or PubMed lookup. Reports use a UTC search timestamp and keep a match count of 0 separate from configuration errors, unreadable files, and a capped scan.
 required_open_webui_version: 0.4.0
 requirements: pydantic
-version: 1.1.0
+version: 1.2.0
 license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
+import asyncio
 import datetime
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -50,7 +52,7 @@ def _clean_line(text: str, max_len: int = 320) -> str:
     return s
 
 
-def _extract_pdf_text(pdf_path: Path, max_pages: int = 25) -> str:
+def _extract_pdf_text(pdf_path: Path, max_pages: int = 25, timeout_seconds: float = 5) -> str:
     # 1. Try pypdf /pymupdf if installed in the Open WebUI container/venv
     try:
         import pypdf  # type: ignore
@@ -71,7 +73,7 @@ def _extract_pdf_text(pdf_path: Path, max_pages: int = 25) -> str:
             ["pdftotext", "-l", str(max_pages), str(pdf_path), "-"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=max(0.2, timeout_seconds),
             check=False,
         )
         if res.returncode == 0 and res.stdout.strip():
@@ -100,6 +102,18 @@ class Tools:
             ge=1,
             le=150,
         )
+        MAX_FILE_BYTES: int = Field(
+            default=2_000_000,
+            description="Skip files larger than this many bytes.",
+            ge=1_000,
+            le=50_000_000,
+        )
+        TIMEOUT_SECONDS: float = Field(
+            default=5.0,
+            description="Stop the scan after this many seconds and report a partial result.",
+            ge=0.0,
+            le=60,
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -114,12 +128,14 @@ class Tools:
 
     def _is_within_root(self, candidate: Path, root: Path) -> bool:
         try:
+            if candidate.is_symlink() and not candidate.exists():
+                return False
             candidate.resolve().relative_to(root.resolve())
             return True
-        except ValueError:
+        except (OSError, ValueError):
             return False
 
-    def search_local_clinical_library(
+    async def search_local_clinical_library(
         self,
         query: str,
         filename_filter: str = "",
@@ -136,6 +152,19 @@ class Tools:
         :param max_matches: Maximum number of matching files/snippets to return (1 to 30).
         :return: Markdown summary of matching local clinical library files and text excerpts.
         """
+        return await asyncio.to_thread(
+            self._search_local_clinical_library_sync,
+            query,
+            filename_filter,
+            max_matches,
+        )
+
+    def _search_local_clinical_library_sync(
+        self,
+        query: str,
+        filename_filter: str = "",
+        max_matches: int = 15,
+    ) -> str:
         q = (query or "").strip()
         if not q:
             return "\n".join(
@@ -169,28 +198,78 @@ class Tools:
 
         files_checked = 0
         files_unreadable = 0
+        files_skipped_symlink = 0
+        files_too_large = 0
         pdf_no_text = 0
         scan_capped = False
+        time_capped = False
         inventory: List[Tuple[str, int]] = []
         hits: List[Tuple[str, List[str]]] = []
+        seen_dirs = set()
+        deadline = time.monotonic() + float(self.valves.TIMEOUT_SECONDS)
 
-        for dirpath, _, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            if time.monotonic() >= deadline:
+                time_capped = True
+                break
+            try:
+                dir_stat = os.stat(dirpath, follow_symlinks=False)
+                dir_key = (dir_stat.st_dev, dir_stat.st_ino)
+            except OSError:
+                dirnames[:] = []
+                continue
+            if dir_key in seen_dirs:
+                dirnames[:] = []
+                continue
+            seen_dirs.add(dir_key)
+            kept_dirs = []
+            for dirname in dirnames:
+                child = Path(dirpath) / dirname
+                try:
+                    if child.is_symlink():
+                        files_skipped_symlink += 1
+                        continue
+                except OSError:
+                    files_skipped_symlink += 1
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
             for fname in sorted(filenames):
+                if time.monotonic() >= deadline:
+                    time_capped = True
+                    break
                 if files_checked >= int(self.valves.MAX_FILES_SCANNED):
                     scan_capped = True
                     break
                 fpath = Path(dirpath) / fname
-                if not self._is_within_root(fpath, root):
+                try:
+                    if fpath.is_symlink() and not fpath.exists():
+                        files_unreadable += 1
+                        files_skipped_symlink += 1
+                        continue
+                    if not self._is_within_root(fpath, root):
+                        files_skipped_symlink += 1
+                        continue
+                    file_stat = fpath.stat()
+                except OSError:
+                    files_unreadable += 1
                     continue
                 ext = fpath.suffix.lower()
                 if ext not in allowed_exts:
                     continue
-                rel_path = str(fpath.resolve().relative_to(root))
+                if file_stat.st_size > int(self.valves.MAX_FILE_BYTES):
+                    files_too_large += 1
+                    continue
+                try:
+                    rel_path = str(fpath.resolve().relative_to(root))
+                except OSError:
+                    files_unreadable += 1
+                    continue
                 if fn_sub and fn_sub not in rel_path.lower():
                     continue
 
                 files_checked += 1
-                size_kb = max(1, fpath.stat().st_size // 1024)
+                size_kb = max(1, file_stat.st_size // 1024)
                 inventory.append((rel_path, size_kb))
 
                 if q == "*":
@@ -198,7 +277,11 @@ class Tools:
 
                 try:
                     if ext == ".pdf":
-                        content = _extract_pdf_text(fpath, max_pages=int(self.valves.MAX_PDF_PAGES))
+                        content = _extract_pdf_text(
+                            fpath,
+                            max_pages=int(self.valves.MAX_PDF_PAGES),
+                            timeout_seconds=max(0.2, deadline - time.monotonic()),
+                        )
                         if not content:
                             pdf_no_text += 1
                     else:
@@ -227,19 +310,29 @@ class Tools:
                     )
                     if len(hits) >= limit:
                         break
-            if scan_capped or (q != "*" and len(hits) >= limit):
+            if scan_capped or time_capped or (q != "*" and len(hits) >= limit):
                 break
 
-        incomplete = scan_capped or files_unreadable > 0 or pdf_no_text > 0
+        incomplete = (
+            scan_capped
+            or time_capped
+            or files_unreadable > 0
+            or pdf_no_text > 0
+            or files_too_large > 0
+            or files_skipped_symlink > 0
+        )
         extra = [
             f"- files_scanned: {files_checked}",
             f"- files_unreadable: {files_unreadable}",
+            f"- files_skipped_symlink: {files_skipped_symlink}",
+            f"- files_too_large: {files_too_large}",
             f"- pdf_no_extractable_text: {pdf_no_text}",
             f"- scan_capped: {'true' if scan_capped else 'false'}",
+            f"- time_capped: {'true' if time_capped else 'false'}",
             f"- **Library Root:** `{root}`",
         ]
         if q == "*":
-            status = "partial" if scan_capped else "ok"
+            status = "partial" if incomplete else "ok"
             lines = [
                 f"# Local Clinical Library File Inventory ({len(inventory)} files scanned)",
                 "",

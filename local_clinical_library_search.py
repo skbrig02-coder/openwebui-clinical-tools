@@ -2,18 +2,37 @@
 title: Path-Jailed Local Clinical Library Exact Search (Companion to Open WebUI Knowledge RAG)
 author: Stuart Brigham, MD
 author_url: https://github.com/skbrig02-coder/openwebui-clinical-tools
-description: Strict read-only, path-traversal-proof filename and full-text/PDF search over the local Clinical Library folder to complement Open WebUI built-in Workspace Knowledge Collections.
+description: Strict read-only, path-traversal-proof filename and full-text/PDF search over the local Clinical Library folder to complement Open WebUI built-in Workspace Knowledge Collections. This is a local filesystem search, not a live federal, NCBI, or PubMed lookup. Reports use a UTC search timestamp and keep a match count of 0 separate from configuration errors, unreadable files, and a capped scan.
 required_open_webui_version: 0.4.0
 requirements: pydantic
-version: 1.0.0
+version: 1.2.0
 license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
+import asyncio
+import datetime
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Tuple
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _library_record(status: str, match_count: str, note: str) -> List[str]:
+    return [
+        "## Retrieval record",
+        f"- status: {status}",
+        f"- match_count: {match_count}",
+        f"- searched_at_utc: {_utc_now_iso()}",
+        "- provenance: local_filesystem",
+        "- ncbi_eutilities: not_used",
+        "- note: Local clinical library search is not a live federal or NCBI lookup. " + note,
+    ]
 try:
     from pydantic import BaseModel, Field
 except ImportError:
@@ -33,7 +52,7 @@ def _clean_line(text: str, max_len: int = 320) -> str:
     return s
 
 
-def _extract_pdf_text(pdf_path: Path, max_pages: int = 25) -> str:
+def _extract_pdf_text(pdf_path: Path, max_pages: int = 25, timeout_seconds: float = 5) -> str:
     # 1. Try pypdf /pymupdf if installed in the Open WebUI container/venv
     try:
         import pypdf  # type: ignore
@@ -54,7 +73,7 @@ def _extract_pdf_text(pdf_path: Path, max_pages: int = 25) -> str:
             ["pdftotext", "-l", str(max_pages), str(pdf_path), "-"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=max(0.2, timeout_seconds),
             check=False,
         )
         if res.returncode == 0 and res.stdout.strip():
@@ -83,6 +102,18 @@ class Tools:
             ge=1,
             le=150,
         )
+        MAX_FILE_BYTES: int = Field(
+            default=2_000_000,
+            description="Skip files larger than this many bytes.",
+            ge=1_000,
+            le=50_000_000,
+        )
+        TIMEOUT_SECONDS: float = Field(
+            default=5.0,
+            description="Stop the scan after this many seconds and report a partial result.",
+            ge=0.0,
+            le=60,
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -97,12 +128,14 @@ class Tools:
 
     def _is_within_root(self, candidate: Path, root: Path) -> bool:
         try:
+            if candidate.is_symlink() and not candidate.exists():
+                return False
             candidate.resolve().relative_to(root.resolve())
             return True
-        except ValueError:
+        except (OSError, ValueError):
             return False
 
-    def search_local_clinical_library(
+    async def search_local_clinical_library(
         self,
         query: str,
         filename_filter: str = "",
@@ -119,39 +152,124 @@ class Tools:
         :param max_matches: Maximum number of matching files/snippets to return (1 to 30).
         :return: Markdown summary of matching local clinical library files and text excerpts.
         """
+        return await asyncio.to_thread(
+            self._search_local_clinical_library_sync,
+            query,
+            filename_filter,
+            max_matches,
+        )
+
+    def _search_local_clinical_library_sync(
+        self,
+        query: str,
+        filename_filter: str = "",
+        max_matches: int = 15,
+    ) -> str:
+        q = (query or "").strip()
+        if not q:
+            return "\n".join(
+                [
+                    "Error: query is required (pass '*' to list library files).",
+                    "- status: invalid_input",
+                    "- provenance: local_filesystem",
+                    f"- checked_at_utc: {_utc_now_iso()}",
+                    "- ncbi_eutilities: not_used",
+                    "- note: Local clinical library search is not a live federal or NCBI lookup. No files were searched.",
+                ]
+            )
         try:
             root = self._resolve_safe_root()
         except Exception as e:
-            return f"Clinical Library Configuration Notice: {e}\nTip: Update the `CLINICAL_LIBRARY_DIR` Valve in Open WebUI Workspace -> Tools."
-
-        q = (query or "").strip()
-        if not q:
-            return "Error: query is required (pass '*' to list library files)."
+            return "\n".join(
+                [
+                    f"Clinical Library Configuration Notice: {e}",
+                    "Tip: Update the `CLINICAL_LIBRARY_DIR` Valve in Open WebUI Workspace -> Tools.",
+                    *_library_record(
+                        "error",
+                        "unavailable",
+                        "error_type: configuration. The library directory was not searched. This is not a zero-match result.",
+                    ),
+                ]
+            )
 
         limit = max(1, min(int(max_matches or 15), 30))
         fn_sub = (filename_filter or "").strip().lower()
         allowed_exts = {".md", ".txt", ".pdf", ".html", ".htm", ".csv", ".json"}
 
         files_checked = 0
+        files_unreadable = 0
+        files_skipped_symlink = 0
+        files_too_large = 0
+        pdf_no_text = 0
+        scan_capped = False
+        time_capped = False
         inventory: List[Tuple[str, int]] = []
         hits: List[Tuple[str, List[str]]] = []
+        seen_dirs = set()
+        deadline = time.monotonic() + float(self.valves.TIMEOUT_SECONDS)
 
-        for dirpath, _, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            if time.monotonic() >= deadline:
+                time_capped = True
+                break
+            try:
+                dir_stat = os.stat(dirpath, follow_symlinks=False)
+                dir_key = (dir_stat.st_dev, dir_stat.st_ino)
+            except OSError:
+                dirnames[:] = []
+                continue
+            if dir_key in seen_dirs:
+                dirnames[:] = []
+                continue
+            seen_dirs.add(dir_key)
+            kept_dirs = []
+            for dirname in dirnames:
+                child = Path(dirpath) / dirname
+                try:
+                    if child.is_symlink():
+                        files_skipped_symlink += 1
+                        continue
+                except OSError:
+                    files_skipped_symlink += 1
+                    continue
+                kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
             for fname in sorted(filenames):
+                if time.monotonic() >= deadline:
+                    time_capped = True
+                    break
                 if files_checked >= int(self.valves.MAX_FILES_SCANNED):
+                    scan_capped = True
                     break
                 fpath = Path(dirpath) / fname
-                if not self._is_within_root(fpath, root):
+                try:
+                    if fpath.is_symlink() and not fpath.exists():
+                        files_unreadable += 1
+                        files_skipped_symlink += 1
+                        continue
+                    if not self._is_within_root(fpath, root):
+                        files_skipped_symlink += 1
+                        continue
+                    file_stat = fpath.stat()
+                except OSError:
+                    files_unreadable += 1
                     continue
                 ext = fpath.suffix.lower()
                 if ext not in allowed_exts:
                     continue
-                rel_path = str(fpath.resolve().relative_to(root))
+                if file_stat.st_size > int(self.valves.MAX_FILE_BYTES):
+                    files_too_large += 1
+                    continue
+                try:
+                    rel_path = str(fpath.resolve().relative_to(root))
+                except OSError:
+                    files_unreadable += 1
+                    continue
                 if fn_sub and fn_sub not in rel_path.lower():
                     continue
 
                 files_checked += 1
-                size_kb = max(1, fpath.stat().st_size // 1024)
+                size_kb = max(1, file_stat.st_size // 1024)
                 inventory.append((rel_path, size_kb))
 
                 if q == "*":
@@ -159,11 +277,18 @@ class Tools:
 
                 try:
                     if ext == ".pdf":
-                        content = _extract_pdf_text(fpath, max_pages=int(self.valves.MAX_PDF_PAGES))
+                        content = _extract_pdf_text(
+                            fpath,
+                            max_pages=int(self.valves.MAX_PDF_PAGES),
+                            timeout_seconds=max(0.2, deadline - time.monotonic()),
+                        )
+                        if not content:
+                            pdf_no_text += 1
                     else:
                         content = fpath.read_text(encoding="utf-8", errors="ignore")
                 except Exception:
                     content = ""
+                    files_unreadable += 1
 
                 if not content and q.lower() in rel_path.lower():
                     hits.append((rel_path, ["[Matched filename]"]))
@@ -185,29 +310,80 @@ class Tools:
                     )
                     if len(hits) >= limit:
                         break
+            if scan_capped or time_capped or (q != "*" and len(hits) >= limit):
+                break
 
+        incomplete = (
+            scan_capped
+            or time_capped
+            or files_unreadable > 0
+            or pdf_no_text > 0
+            or files_too_large > 0
+            or files_skipped_symlink > 0
+        )
+        extra = [
+            f"- files_scanned: {files_checked}",
+            f"- files_unreadable: {files_unreadable}",
+            f"- files_skipped_symlink: {files_skipped_symlink}",
+            f"- files_too_large: {files_too_large}",
+            f"- pdf_no_extractable_text: {pdf_no_text}",
+            f"- scan_capped: {'true' if scan_capped else 'false'}",
+            f"- time_capped: {'true' if time_capped else 'false'}",
+            f"- **Library Root:** `{root}`",
+        ]
         if q == "*":
+            status = "partial" if incomplete else "ok"
             lines = [
                 f"# Local Clinical Library File Inventory ({len(inventory)} files scanned)",
-                f"- **Library Root:** `{root}`",
+                "",
+                *_library_record(status, str(len(inventory[:limit])), "Filename inventory of the local folder."),
+                *extra,
                 "",
             ]
             for idx, (rpath, kb) in enumerate(inventory[:limit], start=1):
                 lines.append(f"{idx}. `{rpath}` ({kb} KB)")
             return "\n".join(lines)
 
+        if not hits and incomplete:
+            return "\n".join(
+                [
+                    f"# Local Clinical Library Search Results: {q}",
+                    "",
+                    *_library_record(
+                        "partial",
+                        "unavailable",
+                        "The scan did not read every eligible file. This is not a confirmed match count of 0.",
+                    ),
+                    *extra,
+                ]
+            )
         if not hits:
-            return f"No matches found for '{q}' across {files_checked} files in `{root}`."
+            return "\n".join(
+                [
+                    f"# Local Clinical Library Search Results: {q}",
+                    "",
+                    *_library_record(
+                        "no_match",
+                        "0",
+                        f"No matches found for '{q}' across {files_checked} fully read files.",
+                    ),
+                    *extra,
+                ]
+            )
 
+        status = "partial" if incomplete else "ok"
         lines = [
             f"# Local Clinical Library Search Results: {q}",
+            "",
+            *_library_record(status, str(len(hits)), "Snippets come from local files that were read during this search."),
             f"- **Library Root:** `{root}` (scanned {files_checked} files, showing {len(hits)} matching files)",
+            *extra,
             "",
         ]
         for idx, (rpath, snippets) in enumerate(hits, start=1):
             lines.append(f"## {idx}. `{rpath}`")
-            for s in snippets:
-                lines.append(f"- {s}")
+            for snippet in snippets:
+                lines.append(f"- {snippet}")
             lines.append("")
 
         return "\n".join(lines)

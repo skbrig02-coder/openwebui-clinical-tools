@@ -2,15 +2,17 @@
 title: NLM RxNorm Drug Normalization and Concept Lookup
 author: Stuart Brigham, MD
 author_url: https://github.com/skbrig02-coder/openwebui-clinical-tools
-description: Queries active NLM RxNorm REST endpoints (rxnav.nlm.nih.gov/REST/) for RxCUI normalization, active ingredients, brand/generic mappings, clinical drug dose forms/strengths, and FDA-label drug interaction prose (replacing the retired Jan 2024 RxNav interaction endpoint).
+description: Queries active NLM RxNorm REST endpoints (rxnav.nlm.nih.gov/REST/) for RxCUI normalization, active ingredients, brand/generic mappings, clinical drug dose forms/strengths, and FDA-label drug interaction prose (replacing the retired Jan 2024 RxNav interaction endpoint). This tool does not call NCBI E-utilities or PubMed. Reports use a UTC retrieval timestamp and keep a successful match count of 0 separate from timeouts, HTTP errors, and malformed responses.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 1.0.0
+version: 1.1.0
 license: Copyright (c) 2026 Stuart Brigham, MD (Free to use with attribution to Stuart Brigham, MD)
 """
 
 import asyncio
+import datetime
 import json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,36 +41,99 @@ def _clean_str(val: str) -> str:
     return " ".join(str(val).replace("\u2014", " - ").replace("\u2013", "-").split())
 
 
-def _sync_get_json(url: str, params: Dict[str, str], timeout: float) -> Tuple[int, Optional[dict]]:
+class Upstream:
+    def __init__(self, status_code: int = 0, payload: Any = None, error_type: str = "", detail: str = ""):
+        self.status_code = int(status_code or 0)
+        self.payload = payload
+        self.error_type = error_type or ""
+        self.detail = detail or ""
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _classify_body(status_code: int, raw: str) -> Upstream:
+    payload = None
+    malformed = False
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            malformed = True
+    else:
+        malformed = True
+    if status_code == 200:
+        if malformed or payload is None:
+            return Upstream(status_code, None, "malformed_response", "Response body was not valid JSON.")
+        return Upstream(status_code, payload, "", "")
+    return Upstream(status_code, None if malformed else payload, "http_error", f"HTTP {status_code}")
+
+
+def _upstream_from_exception(exc: BaseException) -> Upstream:
+    if isinstance(exc, (TimeoutError, socket.timeout)) or "timeout" in type(exc).__name__.lower():
+        return Upstream(0, None, "timeout", "Request timed out.")
+    if isinstance(exc, json.JSONDecodeError) or "json" in type(exc).__name__.lower():
+        return Upstream(0, None, "malformed_response", "Response body was not valid JSON.")
+    return Upstream(0, None, "network_error", "Network request failed.")
+
+
+def _sync_get_json(url: str, params: Dict[str, str], timeout: float) -> Upstream:
     full_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
     req = urllib.request.Request(
         full_url,
-        headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.0", "Accept": "application/json"},
+        headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.1", "Accept": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-            return resp.status, json.loads(raw)
-    except urllib.error.HTTPError as e:
-        return e.code, None
-    except Exception:
-        return 0, None
+            raw = resp.read().decode("utf-8", errors="replace")
+            return _classify_body(getattr(resp, "status", 200) or 200, raw)
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        return _classify_body(exc.code, raw)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return Upstream(0, None, "timeout", "Request timed out.")
+        return Upstream(0, None, "network_error", "Network request failed.")
+    except (TimeoutError, socket.timeout):
+        return Upstream(0, None, "timeout", "Request timed out.")
+    except Exception as exc:
+        return _upstream_from_exception(exc)
 
 
-async def _async_get_json(url: str, params: Dict[str, str], timeout: float) -> Tuple[int, Optional[dict]]:
+async def _async_get_json(url: str, params: Dict[str, str], timeout: float) -> Upstream:
     if httpx is not None:
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
-                headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.0", "Accept": "application/json"},
+                headers={"User-Agent": "OpenWebUI-Clinical-Tools/1.1", "Accept": "application/json"},
             ) as client:
                 resp = await client.get(url, params=params)
-                if resp.status_code == 200:
-                    return 200, resp.json()
-                return resp.status_code, None
-        except Exception:
-            return 0, None
+                return _classify_body(resp.status_code, resp.text)
+        except Exception as exc:
+            return _upstream_from_exception(exc)
     return await asyncio.to_thread(_sync_get_json, url, params, timeout)
+
+
+def _invalid_lookup(message: str) -> str:
+    return "\n".join(
+        [
+            message,
+            "- status: invalid_input",
+            "- provenance: live_http",
+            f"- checked_at_utc: {_utc_now_iso()}",
+            "- ncbi_eutilities: not_used",
+            "- note: No upstream request was sent.",
+        ]
+    )
+
+
+_UPSTREAM_FAILURE_NOTE = "Upstream request failed. This result is not a finding of zero matching records."
 
 
 class Tools:
@@ -101,144 +166,206 @@ class Tools:
         """
         query = (drug_name_or_rxcui or "").strip()
         if not query:
-            return "Error: drug_name_or_rxcui is required."
+            return _invalid_lookup("Error: drug_name_or_rxcui is required.")
 
         timeout_s = float(self.valves.TIMEOUT_SECONDS)
         rxcui = None
         approx_candidates = []
+        call_rows = []
+        errors = []
+
+        def remember(name, fetched, state):
+            call_rows.append((name, fetched, state))
+            if state == "error":
+                errors.append(fetched.error_type or ("malformed_response" if fetched.status_code == 200 else "http_error"))
 
         if query.isdigit():
             rxcui = query
+            call_rows.append(("name_lookup", None, "not_requested"))
         else:
-            st1, d1 = await _async_get_json(
+            exact = await _async_get_json(
                 f"{self.rxnav_base}/rxcui.json",
                 {"name": query, "search": "2"},
                 timeout_s,
             )
-            if st1 == 200 and d1:
-                ids = (d1.get("idGroup") or {}).get("rxnormId") or []
+            if exact.error_type or exact.status_code != 200 or not isinstance(exact.payload, dict):
+                remember("rxcui.json", exact, "error")
+            else:
+                ids = (exact.payload.get("idGroup") or {}).get("rxnormId") or []
                 if ids:
-                    rxcui = ids[0]
+                    rxcui = str(ids[0])
+                    remember("rxcui.json", exact, "ok")
+                else:
+                    remember("rxcui.json", exact, "no_match")
 
-            st_ap, d_ap = await _async_get_json(
+            approx = await _async_get_json(
                 f"{self.rxnav_base}/approximateTerm.json",
                 {"term": query, "maxEntries": "5"},
                 timeout_s,
             )
-            if st_ap == 200 and d_ap:
-                cands = (d_ap.get("approximateGroup") or {}).get("candidate") or []
+            if approx.error_type or approx.status_code != 200 or not isinstance(approx.payload, dict):
+                remember("approximateTerm.json", approx, "error")
+            else:
+                cands = (approx.payload.get("approximateGroup") or {}).get("candidate") or []
                 seen_c = set()
-                for c in cands:
-                    cid = c.get("rxcui")
-                    cname = c.get("name")
-                    if cid and cid not in seen_c:
-                        seen_c.add(cid)
-                        approx_candidates.append(
-                            {"rxcui": cid, "name": cname or "", "score": c.get("score", "")}
-                        )
+                if isinstance(cands, list):
+                    for cand in cands:
+                        if not isinstance(cand, dict):
+                            continue
+                        cid = cand.get("rxcui")
+                        if cid and cid not in seen_c:
+                            seen_c.add(cid)
+                            approx_candidates.append(
+                                {"rxcui": cid, "name": cand.get("name") or "", "score": cand.get("score", "")}
+                            )
+                remember("approximateTerm.json", approx, "ok" if approx_candidates else "no_match")
                 if not rxcui and approx_candidates:
                     rxcui = approx_candidates[0]["rxcui"]
 
         if not rxcui:
-            return f"No RxNorm concept found for '{query}'."
+            failed = [row for row in call_rows if row[2] == "error"]
+            if failed:
+                lines = [
+                    f"# NLM RxNorm Concept Normalization: {query}",
+                    "",
+                    "## Retrieval record",
+                    "- status: error",
+                    "- match_count: unavailable",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- source: NLM RxNorm REST API (https://rxnav.nlm.nih.gov/REST)",
+                ]
+                for name, fetched, state in call_rows:
+                    if fetched is None:
+                        continue
+                    err = fetched.error_type or ("malformed_response" if fetched.status_code == 200 else "http_error")
+                    if state == "error":
+                        lines.append(f"- {name}: status=error error_type: {err} http_status={fetched.status_code}")
+                    else:
+                        lines.append(f"- {name}: status={state}")
+                lines.append(f"- note: {_UPSTREAM_FAILURE_NOTE}")
+                return "\n".join(lines)
+            return "\n".join(
+                [
+                    f"# NLM RxNorm Concept Normalization: {query}",
+                    "",
+                    "## Retrieval record",
+                    "- status: no_match",
+                    "- match_count: 0",
+                    f"- retrieved_at_utc: {_utc_now_iso()}",
+                    "- provenance: live_http",
+                    "- ncbi_eutilities: not_used",
+                    "- source: NLM RxNorm REST API (https://rxnav.nlm.nih.gov/REST)",
+                    "- note: RxNorm responded successfully and the match count is 0.",
+                ]
+            )
 
-        props = {}
-        st_pr, d_pr = await _async_get_json(
-            f"{self.rxnav_base}/rxcui/{rxcui}/properties.json", {}, timeout_s
-        )
-        if st_pr == 200 and d_pr:
-            props = d_pr.get("properties") or {}
+        props_fetch = await _async_get_json(f"{self.rxnav_base}/rxcui/{rxcui}/properties.json", {}, timeout_s)
+        if props_fetch.error_type or props_fetch.status_code != 200 or not isinstance(props_fetch.payload, dict):
+            remember("properties.json", props_fetch, "error")
+            props = {}
+        else:
+            remember("properties.json", props_fetch, "ok")
+            props = props_fetch.payload.get("properties") or {}
 
-        tty_map: Dict[str, List[Dict[str, str]]] = {
-            "IN": [],
-            "PIN": [],
-            "MIN": [],
-            "BN": [],
-            "DF": [],
-            "SCD": [],
-            "SBD": [],
-        }
-        st_all, d_all = await _async_get_json(
-            f"{self.rxnav_base}/rxcui/{rxcui}/allrelated.json", {}, timeout_s
-        )
-        if st_all == 200 and d_all:
-            groups = (d_all.get("allRelatedGroup") or {}).get("conceptGroup") or []
-            for g in groups:
-                tty = g.get("tty")
+        tty_map = {"IN": [], "PIN": [], "MIN": [], "BN": [], "DF": [], "SCD": [], "SBD": []}
+        related = await _async_get_json(f"{self.rxnav_base}/rxcui/{rxcui}/allrelated.json", {}, timeout_s)
+        related_ok = not related.error_type and related.status_code == 200 and isinstance(related.payload, dict)
+        if not related_ok:
+            remember("allrelated.json", related, "error")
+        else:
+            remember("allrelated.json", related, "ok")
+            groups = (related.payload.get("allRelatedGroup") or {}).get("conceptGroup") or []
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                tty = group.get("tty")
                 if tty in tty_map:
-                    for cp in g.get("conceptProperties") or []:
-                        tty_map[tty].append(
-                            {"rxcui": cp.get("rxcui", ""), "name": _clean_str(cp.get("name", ""))}
-                        )
+                    for cp in group.get("conceptProperties") or []:
+                        if isinstance(cp, dict):
+                            tty_map[tty].append({"rxcui": cp.get("rxcui", ""), "name": _clean_str(cp.get("name", ""))})
 
+        overall = "partial" if errors else "ok"
         lines = [
             f"# NLM RxNorm Concept Normalization: {query}",
             "",
-            "## 1. Primary Resolved RxNorm Concept",
-            f"- **Resolved RxCUI:** `{rxcui}`",
-            f"- **Canonical Name:** {_clean_str(props.get('name', query))}",
-            f"- **Term Type (TTY):** `{props.get('tty', 'N/A')}`",
-            f"- **Synonym:** {_clean_str(props.get('synonym', 'None')) or 'None'}",
-            f"- **RxNav Properties URL:** {self.rxnav_base}/rxcui/{rxcui}/properties.json",
-            f"- **RxNav AllRelated URL:** {self.rxnav_base}/rxcui/{rxcui}/allrelated.json",
-            "",
-            "## 2. Active Ingredient(s) and Salt/Multi-Ingredient Forms",
+            "## Retrieval record",
+            f"- status: {overall}",
+            "- match_count: 1",
+            f"- retrieved_at_utc: {_utc_now_iso()}",
+            "- provenance: live_http",
+            "- ncbi_eutilities: not_used",
+            "- source: NLM RxNorm REST API (https://rxnav.nlm.nih.gov/REST)",
         ]
-
-        if tty_map["IN"]:
-            lines.append(
-                "- **Base Ingredient (IN):** "
-                + ", ".join(f"{x['name']} (RxCUI `{x['rxcui']}`)" for x in tty_map["IN"][:8])
-            )
+        for name, fetched, state in call_rows:
+            if fetched is None:
+                lines.append(f"- {name}: status={state}")
+                continue
+            if state == "error":
+                err = fetched.error_type or ("malformed_response" if fetched.status_code == 200 else "http_error")
+                lines.append(f"- {name}: status=error error_type: {err} http_status={fetched.status_code}")
+            else:
+                lines.append(f"- {name}: status={state}")
+        if overall == "partial":
+            lines.append(f"- note: {_UPSTREAM_FAILURE_NOTE}")
+        else:
+            lines.append("- note: RxNorm responded for the calls in this report. retrieved_at_utc is when this tool called RxNorm.")
+        lines.extend(
+            [
+                "",
+                "## 1. Primary Resolved RxNorm Concept",
+                f"- **Resolved RxCUI:** `{rxcui}`",
+                f"- **Canonical Name:** {_clean_str(props.get('name', query))}",
+                f"- **Term Type (TTY):** `{props.get('tty', 'N/A')}`",
+                f"- **Synonym:** {_clean_str(props.get('synonym', 'None')) or 'None'}",
+                f"- **RxNav Properties URL:** {self.rxnav_base}/rxcui/{rxcui}/properties.json",
+                f"- **RxNav AllRelated URL:** {self.rxnav_base}/rxcui/{rxcui}/allrelated.json",
+                "",
+                "## 2. Active Ingredient(s) and Salt/Multi-Ingredient Forms",
+            ]
+        )
+        if not related_ok:
+            lines.append("- **Base Ingredient (IN):** not retrieved. Upstream failure is not a finding that none exist.")
+        elif tty_map["IN"]:
+            lines.append("- **Base Ingredient (IN):** " + ", ".join(f"{x['name']} (RxCUI `{x['rxcui']}`)" for x in tty_map["IN"][:8]))
         else:
             lines.append("- **Base Ingredient (IN):** None listed")
-
-        if tty_map["PIN"]:
-            lines.append(
-                "- **Precise Ingredient / Salt Form (PIN):** "
-                + ", ".join(f"{x['name']} (RxCUI `{x['rxcui']}`)" for x in tty_map["PIN"][:8])
-            )
-        if tty_map["MIN"]:
-            lines.append(
-                "- **Multiple Ingredients (MIN):** "
-                + ", ".join(f"{x['name']} (RxCUI `{x['rxcui']}`)" for x in tty_map["MIN"][:8])
-            )
+        if related_ok and tty_map["PIN"]:
+            lines.append("- **Precise Ingredient / Salt Form (PIN):** " + ", ".join(f"{x['name']} (RxCUI `{x['rxcui']}`)" for x in tty_map["PIN"][:8]))
+        if related_ok and tty_map["MIN"]:
+            lines.append("- **Multiple Ingredients (MIN):** " + ", ".join(f"{x['name']} (RxCUI `{x['rxcui']}`)" for x in tty_map["MIN"][:8]))
 
         lines.append("")
         lines.append("## 3. Brand Names (BN) and Dose Forms (DF)")
-        if tty_map["BN"]:
-            lines.append(
-                "- **Brand Names (BN):** "
-                + ", ".join(f"{x['name']} (`{x['rxcui']}`)" for x in tty_map["BN"][:12])
-            )
+        if not related_ok:
+            lines.append("- **Brand Names (BN):** not retrieved. Upstream failure is not a finding that none exist.")
+        elif tty_map["BN"]:
+            lines.append("- **Brand Names (BN):** " + ", ".join(f"{x['name']} (`{x['rxcui']}`)" for x in tty_map["BN"][:12]))
         else:
             lines.append("- **Brand Names (BN):** None linked")
-
-        if tty_map["DF"]:
-            lines.append(
-                "- **Dose Forms (DF):** " + ", ".join(x["name"] for x in tty_map["DF"][:10])
-            )
+        if related_ok and tty_map["DF"]:
+            lines.append("- **Dose Forms (DF):** " + ", ".join(x["name"] for x in tty_map["DF"][:10]))
 
         if include_dose_forms:
             lines.append("")
             lines.append("## 4. Clinical Drug Strengths (SCD) and Branded Strengths (SBD)")
-            if tty_map["SCD"]:
-                for x in tty_map["SCD"][:12]:
-                    lines.append(f"- **SCD:** {x['name']} (RxCUI `{x['rxcui']}`)")
+            if not related_ok:
+                lines.append("- **SCD / SBD:** not retrieved. Upstream failure is not a finding that none exist.")
             else:
-                lines.append("- **SCD:** None listed")
-
-            if tty_map["SBD"]:
-                for x in tty_map["SBD"][:8]:
-                    lines.append(f"- **SBD:** {x['name']} (RxCUI `{x['rxcui']}`)")
+                if tty_map["SCD"]:
+                    for item in tty_map["SCD"][:12]:
+                        lines.append(f"- **SCD:** {item['name']} (RxCUI `{item['rxcui']}`)")
+                else:
+                    lines.append("- **SCD:** None listed")
+                for item in tty_map["SBD"][:8]:
+                    lines.append(f"- **SBD:** {item['name']} (RxCUI `{item['rxcui']}`)")
 
         if approx_candidates:
             lines.append("")
             lines.append("## 5. Top Approximate Term Candidates")
-            for c in approx_candidates[:5]:
-                lines.append(
-                    f"- `{c['rxcui']}`: {_clean_str(c['name'])} (match score: {c['score']})"
-                )
+            for cand in approx_candidates[:5]:
+                lines.append(f"- `{cand['rxcui']}`: {_clean_str(cand['name'])} (match score: {cand['score']})")
 
         lines.append("")
         lines.append(
@@ -246,10 +373,7 @@ class Tools:
         )
         return "\n".join(lines)
 
-    async def check_fda_label_interactions(
-        self,
-        drug_names: List[str],
-    ) -> str:
+    async def check_fda_label_interactions(self, drug_names: List[str]) -> str:
         """
         Replacement for the retired NLM RxNav Drug Interaction API (discontinued Jan 2, 2024).
         Normalizes each drug via NLM RxNorm to its generic ingredient name, then cross-checks
@@ -259,109 +383,175 @@ class Tools:
         :param drug_names: List of 2 to 8 drug names to cross-check (e.g., ['apixaban', 'clarithromycin', 'aspirin']).
         :return: Structured Markdown report of FDA label interaction sections and matched drug mentions.
         """
-        cleaned_drugs = [d.strip() for d in (drug_names or []) if d and d.strip()]
+        cleaned_drugs = [d.strip() for d in (drug_names or []) if d and str(d).strip()]
         if len(cleaned_drugs) < 2:
-            return "Error: Please provide at least 2 drug names in drug_names."
+            return _invalid_lookup("Error: Please provide at least 2 drug names in drug_names.")
         cleaned_drugs = cleaned_drugs[:8]
-
         timeout_s = float(self.valves.TIMEOUT_SECONDS)
         resolved = []
-        for d in cleaned_drugs:
-            rxcui = None
-            ing_name = d
-            st1, d1 = await _async_get_json(
-                f"{self.rxnav_base}/rxcui.json", {"name": d, "search": "2"}, timeout_s
-            )
-            if st1 == 200 and d1:
-                ids = (d1.get("idGroup") or {}).get("rxnormId") or []
-                if ids:
-                    rxcui = ids[0]
-                    st_rel, d_rel = await _async_get_json(
-                        f"{self.rxnav_base}/rxcui/{rxcui}/related.json", {"tty": "IN"}, timeout_s
+        for drug in cleaned_drugs:
+            item = {
+                "input": drug,
+                "ingredient": drug,
+                "rxcui": "N/A",
+                "interaction_text": None,
+                "set_id": "",
+                "rx_state": "ok",
+                "fda_state": "ok",
+                "rx_error": "",
+                "fda_error": "",
+                "fda_http": 0,
+            }
+            exact = await _async_get_json(f"{self.rxnav_base}/rxcui.json", {"name": drug, "search": "2"}, timeout_s)
+            if exact.error_type or exact.status_code != 200 or not isinstance(exact.payload, dict):
+                item["rx_state"] = "error"
+                item["rx_error"] = exact.error_type or ("malformed_response" if exact.status_code == 200 else "http_error")
+            else:
+                ids = (exact.payload.get("idGroup") or {}).get("rxnormId") or []
+                if not ids:
+                    item["rx_state"] = "no_match"
+                else:
+                    item["rxcui"] = ids[0]
+                    related = await _async_get_json(
+                        f"{self.rxnav_base}/rxcui/{item['rxcui']}/related.json",
+                        {"tty": "IN"},
+                        timeout_s,
                     )
-                    if st_rel == 200 and d_rel:
-                        groups = (d_rel.get("relatedGroup") or {}).get("conceptGroup") or []
-                        for g in groups:
-                            cps = g.get("conceptProperties") or []
-                            if cps and cps[0].get("name"):
-                                ing_name = cps[0]["name"]
-                                rxcui = cps[0].get("rxcui", rxcui)
+                    if related.error_type or related.status_code != 200 or not isinstance(related.payload, dict):
+                        item["rx_state"] = "error"
+                        item["rx_error"] = related.error_type or ("malformed_response" if related.status_code == 200 else "http_error")
+                    else:
+                        groups = (related.payload.get("relatedGroup") or {}).get("conceptGroup") or []
+                        for group in groups:
+                            if not isinstance(group, dict):
+                                continue
+                            props = group.get("conceptProperties") or []
+                            if props and isinstance(props[0], dict) and props[0].get("name"):
+                                item["ingredient"] = props[0]["name"]
+                                item["rxcui"] = props[0].get("rxcui", item["rxcui"])
                                 break
-
-            interaction_text = ""
-            set_id = ""
-            st_fda, d_fda = await _async_get_json(
+            fda = await _async_get_json(
                 "https://api.fda.gov/drug/label.json",
-                {"search": f'openfda.generic_name:"{ing_name}"', "limit": "3"},
+                {"search": f'openfda.generic_name:"{item["ingredient"]}"', "limit": "3"},
                 timeout_s,
             )
-            if st_fda == 200 and d_fda:
-                res = d_fda.get("results") or []
-                for rec in res:
-                    di = rec.get("drug_interactions")
-                    if di:
-                        interaction_text = _clean_str(" ".join(di))
-                        set_id = rec.get("set_id", "")
-                        break
+            item["fda_http"] = fda.status_code
+            if fda.status_code == 404:
+                item["fda_state"] = "no_match"
+                item["interaction_text"] = ""
+            elif fda.error_type or fda.status_code != 200 or not isinstance(fda.payload, dict):
+                item["fda_state"] = "error"
+                item["fda_error"] = fda.error_type or ("malformed_response" if fda.status_code == 200 else "http_error")
+            else:
+                results = fda.payload.get("results")
+                if not isinstance(results, list):
+                    item["fda_state"] = "error"
+                    item["fda_error"] = "malformed_response"
+                else:
+                    item["interaction_text"] = ""
+                    item["fda_state"] = "no_match" if not results else "ok"
+                    for rec in results:
+                        if not isinstance(rec, dict):
+                            continue
+                        interactions = rec.get("drug_interactions")
+                        if interactions:
+                            item["interaction_text"] = _clean_str(" ".join(str(x) for x in interactions))
+                            item["set_id"] = rec.get("set_id", "")
+                            item["fda_state"] = "ok"
+                            break
+                    if results and item["fda_state"] != "ok":
+                        item["fda_state"] = "ok"
+                        item["set_id"] = results[0].get("set_id", "") if isinstance(results[0], dict) else ""
+            resolved.append(item)
 
-            resolved.append(
-                {
-                    "input": d,
-                    "ingredient": ing_name,
-                    "rxcui": rxcui or "N/A",
-                    "interaction_text": interaction_text,
-                    "set_id": set_id,
-                }
-            )
+        fda_failed = [item for item in resolved if item["fda_state"] == "error"]
+        any_text = any(item["interaction_text"] is not None and item["fda_state"] != "error" for item in resolved)
+        if fda_failed and not any_text:
+            overall = "error"
+        elif fda_failed or any(item["rx_state"] == "error" for item in resolved):
+            overall = "partial"
+        else:
+            overall = "ok"
 
         lines = [
             "# RxNorm + openFDA Label Drug Interaction Cross-Check",
             "",
-            "## 1. Normalized Medications (NLM RxNorm)",
+            "## Retrieval record",
+            f"- status: {overall}",
+            "- match_count: unavailable" if overall == "error" else "- match_count: pending",
+            f"- retrieved_at_utc: {_utc_now_iso()}",
+            "- provenance: live_http",
+            "- ncbi_eutilities: not_used",
+            "- source: NLM RxNorm REST API and openFDA drug/label. Static PMID citations are not used.",
         ]
+        for item in resolved:
+            if item["rx_state"] == "error":
+                lines.append(f"- rxnorm[{item['input']}]: status=error error_type: {item['rx_error']}")
+            else:
+                lines.append(f"- rxnorm[{item['input']}]: status={item['rx_state']}")
+            if item["fda_state"] == "error":
+                lines.append(
+                    f"- openfda[{item['ingredient']}]: status=error error_type: {item['fda_error']} http_status={item['fda_http']}"
+                )
+            else:
+                lines.append(f"- openfda[{item['ingredient']}]: status={item['fda_state']} http_status={item['fda_http']}")
+        if overall in ("error", "partial"):
+            lines.append(f"- note: {_UPSTREAM_FAILURE_NOTE}")
+        lines.extend(["", "## 1. Normalized Medications (NLM RxNorm)"])
         for item in resolved:
             lines.append(
                 f"- **{item['input']}** -> Ingredient: **{item['ingredient']}** (RxCUI `{item['rxcui']}`, SPL SetID `{item['set_id'] or 'N/A'}`)"
             )
-
         lines.append("")
         lines.append("## 2. Pairwise Mentions in Official FDA Label `drug_interactions` Sections")
         found_any = False
-        for i, primary in enumerate(resolved):
-            text_low = primary["interaction_text"].lower()
-            if not text_low:
-                continue
-            for j, other in enumerate(resolved):
-                if i == j:
+        comparable = [item for item in resolved if item["fda_state"] != "error" and item["interaction_text"] is not None]
+        if len(comparable) == len(resolved):
+            for primary in comparable:
+                text_low = (primary["interaction_text"] or "").lower()
+                if not text_low:
                     continue
-                terms = {other["input"].lower(), other["ingredient"].lower()}
-                for t in terms:
-                    if len(t) >= 3 and t in text_low:
-                        idx = text_low.find(t)
-                        start = max(0, idx - 140)
-                        end = min(len(primary["interaction_text"]), idx + 360)
-                        snippet = primary["interaction_text"][start:end]
-                        lines.append(
-                            f"- **Label for {primary['ingredient']}** mentions **{other['ingredient']}** (`{t}`): \"...{snippet}...\""
-                        )
-                        found_any = True
-                        break
-
-        if not found_any:
-            lines.append(
-                "- No direct literal name match found between pairs; review class-level interactions below (FDA labels frequently list drug classes such as CYP3A4 inhibitors, anticoagulants, NSAIDs, or ACE inhibitors rather than every individual drug name)."
-            )
-
+                for other in comparable:
+                    if other is primary:
+                        continue
+                    terms = {other["input"].lower(), other["ingredient"].lower()}
+                    for term in terms:
+                        if len(term) >= 3 and term in text_low:
+                            idx = text_low.find(term)
+                            start = max(0, idx - 140)
+                            end = min(len(primary["interaction_text"]), idx + 360)
+                            snippet = primary["interaction_text"][start:end]
+                            lines.append(
+                                f"- **Label for {primary['ingredient']}** mentions **{other['ingredient']}** (`{term}`): \"...{snippet}...\""
+                            )
+                            found_any = True
+                            break
+            pair_count = sum(1 for line in lines if line.startswith("- **Label for "))
+            lines.append(f"- pairwise_literal_match_count: {pair_count}")
+            if not found_any:
+                lines.append("- note: The FDA labels were retrieved. Literal pairwise name matches were counted and the count is 0.")
+        else:
+            lines.append("- Pairwise literal matching was not completed for every drug because at least one label request failed.")
         lines.append("")
         lines.append("## 3. Summary of FDA `drug_interactions` Sections per Drug")
         for item in resolved:
-            excerpt = (
-                item["interaction_text"][:1000] + "... [truncated]"
-                if len(item["interaction_text"]) > 1000
-                else (item["interaction_text"] or "No drug_interactions section found in openFDA.")
-            )
             lines.append(f"### {item['ingredient']} (RxCUI `{item['rxcui']}`)")
-            lines.append(excerpt)
+            if item["fda_state"] == "error":
+                lines.append("The label section was not retrieved. This is not a finding of zero matching records.")
+            else:
+                text = item["interaction_text"] or ""
+                if len(text) > 1000:
+                    text = text[:1000] + "... [truncated]"
+                lines.append(text or "The retrieved label response did not include a drug_interactions section.")
             lines.append("")
-
+        # Replace the pending match count once pairwise counting is known.
+        if overall != "error":
+            for i, line in enumerate(lines):
+                if line == "- match_count: pending":
+                    shown = "0"
+                    for candidate in lines:
+                        if candidate.startswith("- pairwise_literal_match_count: "):
+                            shown = candidate.split(": ", 1)[1]
+                    lines[i] = f"- match_count: {shown}"
+                    break
         return "\n".join(lines)
